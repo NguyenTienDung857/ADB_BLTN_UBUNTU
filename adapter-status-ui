@@ -1,0 +1,1225 @@
+#!/usr/bin/env python3
+import glob
+import json
+import os
+import re
+import signal
+import shutil
+import socket
+import subprocess
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk, Pango
+
+
+CONFIG_DIR = os.path.expanduser("~/.config/adapter-status")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+CACHE_DIR = os.path.expanduser("~/.cache/adapter-status")
+PROCESS_FILE = os.path.join(CACHE_DIR, "child-processes.json")
+APP_RUN_ID = f"{os.getpid()}-{int(time.time())}"
+PROCESS_LOCK = threading.Lock()
+
+DEFAULT_CONFIG = {
+    "iface": "enx1c860b2bbfcf",
+    "host_cidr": "192.168.244.10/24",
+    "device_ip": "192.168.244.1",
+    "adb_port": "4321",
+}
+CONNECT_WINDOW_SECONDS = 60.0
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_ADB_WORKDIR = os.path.expanduser("~/BLTN_ADB")
+IFACE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+USB_IFACE_PATTERN = re.compile(r"enx[0-9A-Fa-f]{12}")
+
+HELP_TEXT = """HƯỚNG DẪN SỬ DỤNG ADAPTER STATUS
+
+Mục đích
+App này dùng để quan sát trạng thái cổng USB Network Adapter và trạng thái ADB tới thiết bị.
+App tự cập nhật mỗi 1 giây và không cần bạn gõ lệnh kiểm tra thủ công.
+
+Thông số đang dùng
+- Tên cổng: enx1c860b2bbfcf
+- IP adapter trên máy tính: 192.168.244.10/24
+- IP thiết bị: 192.168.244.1
+- ADB port: 4321
+- File lưu cấu hình: ~/.config/adapter-status/config.json
+- Script kết nối ADB: /home/bltn/BLTN_ADB/adb.sh
+
+Cách mở app
+1. Double-click icon Adapter Status ngoài Desktop.
+2. Hoặc mở terminal và chạy:
+   /home/bltn/BLTN_ADB/adapter-status-ui
+
+Ý nghĩa các trường trên app
+- Tên cổng: tên network adapter mà app đang theo dõi.
+- IP adapter: IP cần gán cho máy tính trên cổng USB Ethernet.
+- IP thiết bị: IP của thiết bị ở đầu bên kia.
+- ADB port: cổng TCP dùng cho ADB.
+- Trạng thái kết nối cổng: Đã kết nối nghĩa là có link vật lý; Chưa kết nối nghĩa là chưa có link hoặc đã rút cổng.
+- IP hiện tại: IP thực tế đang có trên cổng.
+- Ping thiết bị: OK nghĩa là mạng tới thiết bị thông.
+- ADB status: device nghĩa là ADB đã sẵn sàng.
+
+Quy trình khi rút/cắm lại cổng
+1. Mở app Adapter Status.
+2. Rút/cắm lại cổng USB Network Adapter.
+3. Quan sát dòng trạng thái lớn ở giữa app.
+4. Nếu thấy đã có link nhưng chưa có IP hoặc chưa ADB, bấm ADB Connect.
+5. Nếu cửa sổ ADB ngắn, bấm ADB Connect trước rồi reset BLTN khi app đang canh.
+6. Khi thấy CONNECTED - ADB READY, có thể bấm Mở Terminal hoặc dùng adb shell.
+
+Ý nghĩa trạng thái lớn
+- CHƯA THẤY ADAPTER: máy chưa nhận cổng USB Network Adapter.
+- CHƯA CẮM / CHƯA CÓ LINK: có adapter nhưng link vật lý chưa lên, thường là dây/cổng chưa cắm đúng.
+- CÓ LINK, CHƯA CÓ IP - BẤM ADB CONNECT: link vật lý đã lên nhưng cổng chưa có IP 192.168.244.10/24.
+- ĐANG CHỜ BLTN LÊN MẠNG: IP trên máy đã có nhưng chưa thấy thiết bị 192.168.244.1.
+- ADB CHƯA CONNECT - BẤM ADB CONNECT: mạng đã OK nhưng ADB chưa connect.
+- CONNECTED - ADB READY: kết nối đầy đủ, có thể dùng adb shell.
+
+Các nút thao tác
+- Cấu hình IP: gán IP adapter cho cổng đang chọn và bật cổng lên.
+- ADB Connect: gán lại IP, dọn ADB cũ/treo, rồi canh bắt ADB trong 60 giây.
+- Mở Terminal: chỉ sáng khi ADB đã connect; mở terminal tại thư mục app và chạy ./adb.sh.
+- Help: mở hướng dẫn này.
+
+Khi nào cần sửa thông số
+Nếu sau khi rút/cắm lại mà tên cổng thay đổi, sửa ô Tên cổng rồi bấm Cấu hình IP hoặc ADB Connect để lưu và dùng cấu hình mới.
+Cách xem tên cổng bằng terminal:
+   ip -br link
+
+Với máy hiện tại, cổng đúng đang dùng là:
+   enx1c860b2bbfcf
+
+Cách dùng adb.sh
+Khi app báo CONNECTED - ADB READY, bấm Mở Terminal hoặc mở terminal tại /home/bltn/BLTN_ADB và chạy:
+   ./adb.sh
+
+Script adb.sh sẽ:
+1. Đọc thông số từ file cấu hình của app.
+2. Tự gán IP cho cổng.
+3. Tự set ADB_VENDOR_KEYS.
+4. Kết nối ADB tới thiết bị.
+5. Mở adb shell.
+
+Xử lý lỗi thường gặp
+- No such device: tên cổng sai hoặc cổng chưa được máy nhận. Mở app, kiểm tra Tên cổng, hoặc dùng ip -br link để xem tên thật.
+- unauthorized: ADB key chưa được thiết bị chấp nhận hoặc ADB server chạy sai key. Chạy source ~/.bashrc rồi ./adb.sh; nếu thiết bị có màn hình xác nhận thì chọn allow.
+- offline: ADB server đang giữ transport cũ; bấm ADB Connect để app dọn và bắt lại.
+- Connection refused: mạng ping được nhưng ADB service trên thiết bị chưa mở port 4321. Bấm ADB Connect trước rồi reset BLTN trong lúc app đang canh.
+- Ping Fail: kiểm tra dây/cổng, sau đó bấm Cấu hình IP.
+
+Lệnh kiểm tra nhanh bằng terminal
+   ip -br addr show enx1c860b2bbfcf
+   ping -c 3 192.168.244.1
+   adb devices
+   adb shell
+
+Ghi chú vận hành
+Luôn dùng app để xem trạng thái trước. Khi trạng thái đã là CONNECTED - ADB READY thì mới chạy adb shell hoặc ./adb.sh để tránh lỗi kết nối.
+Terminal do app mở sẽ truyền ADAPTER_STATUS_TRACK=1 để adb.sh tự ghi PID của session ADB."""
+
+
+def sanitize_iface(value, fallback=DEFAULT_CONFIG["iface"]):
+    text = str(value or "").strip()
+    if IFACE_PATTERN.fullmatch(text):
+        return text
+
+    match = USB_IFACE_PATTERN.search(text)
+    if match:
+        return match.group(0)
+
+    return fallback
+
+
+def load_config():
+    config = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        for key in DEFAULT_CONFIG:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                config[key] = sanitize_iface(value) if key == "iface" else value.strip()
+    except (OSError, json.JSONDecodeError):
+        pass
+    return config
+
+
+def save_config(config):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    safe_config = {key: str(config.get(key, DEFAULT_CONFIG[key])).strip() for key in DEFAULT_CONFIG}
+    safe_config["iface"] = sanitize_iface(safe_config["iface"])
+    with open(CONFIG_FILE, "w", encoding="utf-8") as handle:
+        json.dump(safe_config, handle, indent=2, sort_keys=True)
+
+
+def constrain_label_width(label, max_width_chars=92):
+    label.set_line_wrap(True)
+    label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    label.set_max_width_chars(max_width_chars)
+    label.set_ellipsize(Pango.EllipsizeMode.NONE)
+    return label
+
+
+def make_text_panel(height, monospace=True):
+    scrolled = Gtk.ScrolledWindow()
+    scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+    scrolled.set_size_request(-1, height)
+    scrolled.set_hexpand(True)
+    scrolled.set_vexpand(False)
+    scrolled.get_style_context().add_class("card")
+
+    text_view = Gtk.TextView()
+    text_view.set_editable(False)
+    text_view.set_cursor_visible(False)
+    text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    text_view.set_monospace(monospace)
+    text_view.set_left_margin(8)
+    text_view.set_right_margin(8)
+    text_view.set_top_margin(8)
+    text_view.set_bottom_margin(8)
+    scrolled.add(text_view)
+    return scrolled, text_view
+
+
+def set_text_view(text_view, text):
+    buffer = text_view.get_buffer()
+    buffer.set_text(text or "")
+    end_iter = buffer.get_end_iter()
+    mark = buffer.create_mark(None, end_iter, False)
+    text_view.scroll_mark_onscreen(mark)
+
+
+def command_name(command):
+    if not command:
+        return ""
+    return os.path.basename(str(command[0]))
+
+
+def command_text(command):
+    return " ".join(str(part) for part in command)
+
+
+def proc_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return ""
+    return data.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+
+
+def proc_argv(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return []
+    return [
+        item.decode("utf-8", errors="replace")
+        for item in data.split(b"\0")
+        if item
+    ]
+
+
+def proc_start_time(pid):
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+
+    marker = data.rfind(")")
+    if marker < 0:
+        return None
+    fields = data[marker + 2 :].split()
+    if len(fields) <= 19:
+        return None
+    return fields[19]
+
+
+def process_exists(pid, start_time=None):
+    current_start = proc_start_time(pid)
+    if not current_start:
+        return False
+    return start_time is None or str(start_time) == current_start
+
+
+def read_process_records():
+    try:
+        with open(PROCESS_FILE, "r", encoding="utf-8") as handle:
+            records = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return records if isinstance(records, list) else []
+
+
+def write_process_records(records):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    temp_path = f"{PROCESS_FILE}.{os.getpid()}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(records, handle, indent=2, sort_keys=True)
+    os.replace(temp_path, PROCESS_FILE)
+
+
+def record_matches_process(record):
+    try:
+        pid = int(record.get("pid", 0))
+    except (TypeError, ValueError):
+        return False
+    start_time = record.get("start_time")
+    return pid > 1 and process_exists(pid, start_time)
+
+
+def register_process(pid, command, purpose):
+    start_time = proc_start_time(pid)
+    if not start_time:
+        return None
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = pid
+
+    record = {
+        "pid": int(pid),
+        "pgid": int(pgid),
+        "start_time": start_time,
+        "command": command_text(command),
+        "purpose": purpose,
+        "owner_pid": os.getpid(),
+        "owner_run": APP_RUN_ID,
+        "created_at": time.time(),
+    }
+
+    with PROCESS_LOCK:
+        records = [item for item in read_process_records() if record_matches_process(item)]
+        already_recorded = any(
+            item.get("pid") == record["pid"] and item.get("start_time") == record["start_time"]
+            for item in records
+        )
+        if not already_recorded:
+            records.append(record)
+            write_process_records(records)
+    return record
+
+
+def unregister_process(pid):
+    with PROCESS_LOCK:
+        records = [
+            item
+            for item in read_process_records()
+            if record_matches_process(item)
+            and not (item.get("pid") == pid and item.get("owner_run") == APP_RUN_ID)
+        ]
+        write_process_records(records)
+
+
+def tracked_adb_server_pids():
+    current_uid = os.getuid()
+    pids = set()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pids
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != current_uid:
+                continue
+        except OSError:
+            continue
+        cmdline = proc_cmdline(pid)
+        if "adb" in cmdline and "fork-server" in cmdline and " server" in f" {cmdline} ":
+            pids.add(pid)
+    return pids
+
+
+def register_new_adb_servers(existing_pids):
+    for pid in tracked_adb_server_pids() - set(existing_pids):
+        register_process(pid, ["adb", "fork-server", "server"], "adb-server")
+
+
+def kill_tracked_record(record, grace_seconds=0.35):
+    try:
+        pid = int(record.get("pid", 0))
+        pgid = int(record.get("pgid", 0)) or os.getpgid(pid)
+    except (TypeError, ValueError, OSError):
+        return False
+
+    if pid <= 1 or pgid <= 1 or pid == os.getpid() or pgid == os.getpgrp():
+        return False
+    if not record_matches_process(record):
+        return False
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return False
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not record_matches_process(record):
+            return True
+        time.sleep(0.05)
+
+    if record_matches_process(record):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    return True
+
+
+def live_process_record(pid, purpose):
+    start_time = proc_start_time(pid)
+    if not start_time:
+        return None
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = pid
+    return {
+        "pid": int(pid),
+        "pgid": int(pgid),
+        "start_time": start_time,
+        "command": proc_cmdline(pid),
+        "purpose": purpose,
+        "owner_pid": os.getpid(),
+        "owner_run": APP_RUN_ID,
+        "created_at": time.time(),
+    }
+
+
+def adb_process_purpose(argv, target):
+    if not argv or os.path.basename(argv[0]) != "adb":
+        return ""
+    if "fork-server" in argv and "server" in argv:
+        return "adb-server"
+
+    action = argv[1] if len(argv) > 1 else ""
+    if action in {"connect", "disconnect", "devices", "kill-server", "start-server"}:
+        return f"adb-{action}"
+
+    joined = "\0".join(argv)
+    if target and target in joined:
+        return "adb-target-client"
+
+    return ""
+
+
+def kill_adb_processes_for_reconnect(target):
+    current_uid = os.getuid()
+    killed = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return killed
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid <= 1 or pid == os.getpid():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != current_uid:
+                continue
+        except OSError:
+            continue
+
+        argv = proc_argv(pid)
+        purpose = adb_process_purpose(argv, target)
+        if not purpose:
+            continue
+
+        record = live_process_record(pid, purpose)
+        if record and kill_tracked_record(record):
+            killed.append(record)
+
+    with PROCESS_LOCK:
+        remaining = [
+            item
+            for item in read_process_records()
+            if record_matches_process(item)
+            and item.get("pid") not in {record["pid"] for record in killed}
+        ]
+        write_process_records(remaining)
+    return killed
+
+
+def cleanup_previous_processes(include_current=False, purpose_prefixes=None):
+    killed = []
+    killed_keys = set()
+    with PROCESS_LOCK:
+        records = read_process_records()
+
+    for record in records:
+        if not include_current and record.get("owner_run") == APP_RUN_ID:
+            continue
+        purpose = str(record.get("purpose", ""))
+        if purpose_prefixes and not any(purpose.startswith(prefix) for prefix in purpose_prefixes):
+            continue
+        if not record_matches_process(record):
+            continue
+        if kill_tracked_record(record):
+            killed.append(record)
+            killed_keys.add((record.get("pid"), record.get("start_time")))
+
+    with PROCESS_LOCK:
+        remaining = [
+            item
+            for item in read_process_records()
+            if record_matches_process(item)
+            and (item.get("pid"), item.get("start_time")) not in killed_keys
+        ]
+        write_process_records(remaining)
+    return killed
+
+
+def adb_env():
+    env = os.environ.copy()
+    keys = []
+    default_key = os.path.expanduser("~/.android/adbkey")
+    if os.path.exists(default_key):
+        keys.append(default_key)
+    keys.extend(sorted(glob.glob(os.path.expanduser("~/.android/*/adbkey"))))
+    if keys:
+        env["ADB_VENDOR_KEYS"] = ":".join(keys)
+    return env
+
+
+def run(command, timeout=2, purpose="command"):
+    is_adb_command = command_name(command) == "adb"
+    adb_servers_before = tracked_adb_server_pids() if is_adb_command else set()
+    proc = None
+    record = None
+    try:
+        proc = subprocess.Popen(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=adb_env(),
+            start_new_session=True,
+        )
+        record = register_process(proc.pid, command, purpose)
+        output, _stderr = proc.communicate(timeout=timeout)
+        return proc.returncode, (output or "").strip()
+    except subprocess.TimeoutExpired:
+        if record:
+            kill_tracked_record(record)
+        elif proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            output, _stderr = proc.communicate(timeout=1)
+        except Exception:
+            output = ""
+        text = (output or "").strip()
+        if text:
+            text += "\n"
+        return 124, f"{text}Command timeout: {command_text(command)}"
+    except Exception as exc:
+        return 1, str(exc)
+    finally:
+        if is_adb_command:
+            register_new_adb_servers(adb_servers_before)
+        if proc:
+            unregister_process(proc.pid)
+
+
+def read_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def detect_usb_iface():
+    try:
+        names = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return None
+    for name in names:
+        if name.startswith("enx"):
+            return name
+    return None
+
+
+def host_ip_from_cidr(host_cidr):
+    return host_cidr.split("/", 1)[0].strip()
+
+
+def adb_target(config):
+    return f"{config['device_ip']}:{config['adb_port']}"
+
+
+def adb_state_from_devices(devices_output, target):
+    for line in devices_output.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == target:
+            return parts[1]
+    return ""
+
+
+def tcp_port_open(host, port, timeout=0.4):
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def configure_ip_commands(config):
+    return [
+        ["sudo", "ip", "addr", "replace", config["host_cidr"], "dev", config["iface"]],
+        ["sudo", "ip", "link", "set", config["iface"], "up"],
+    ]
+
+
+def adb_connect_commands(config):
+    return [
+        ["adb", "connect", adb_target(config)],
+        ["adb", "devices"],
+    ]
+
+
+def append_command_output(outputs, label, code, output):
+    if output:
+        outputs.append(output)
+    if code != 0:
+        outputs.append(f"{label} lỗi ({code}).")
+
+
+def adb_reconnect(config):
+    target = adb_target(config)
+    outputs = [f"Đang canh ADB tối đa {int(CONNECT_WINDOW_SECONDS)} giây: {target}"]
+
+    code, output = run(["adb", "disconnect", target], timeout=2, purpose="adb-reconnect-disconnect")
+    if output and "no such device" not in output:
+        outputs.append(output)
+    if code != 0 and "no such device" not in output:
+        outputs.append(f"adb disconnect {target} lỗi ({code}).")
+
+    killed = kill_adb_processes_for_reconnect(target)
+    if killed:
+        outputs.append(f"Đã dọn {len(killed)} tiến trình ADB cũ/treo.")
+
+    code, output = run(["adb", "start-server"], timeout=5, purpose="adb-reconnect-start")
+    if output:
+        outputs.append(output)
+    if code != 0:
+        outputs.append(f"adb start-server lỗi ({code}).")
+
+    last_devices = ""
+    last_state = ""
+    last_connect_output = ""
+    last_ip_error = ""
+    attempt = 0
+    ping_seen = False
+    last_ping_ok = False
+    next_configure_at = 0.0
+    next_ping_at = 0.0
+    deadline = time.monotonic() + CONNECT_WINDOW_SECONDS
+
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if now >= next_configure_at:
+            for command in configure_ip_commands(config):
+                code, output = run(command, timeout=3, purpose="adb-reconnect-ip")
+                if code != 0:
+                    last_ip_error = output or f"{command_text(command)} lỗi ({code})"
+            next_configure_at = now + 1.0
+
+        if now >= next_ping_at:
+            ping_code, _ping_output = run(
+                ["ping", "-c", "1", "-W", "1", config["device_ip"]],
+                timeout=2,
+                purpose="adb-reconnect-ping",
+            )
+            last_ping_ok = ping_code == 0
+            ping_seen = ping_seen or last_ping_ok
+            next_ping_at = now + 2.0
+
+        attempt += 1
+        if last_ping_ok or ping_seen:
+            code, output = run(["adb", "connect", target], timeout=5, purpose="adb-reconnect-connect")
+            if output:
+                last_connect_output = output
+
+        code, devices = run(["adb", "devices"], timeout=2, purpose="adb-reconnect-state")
+        last_devices = devices
+        last_state = adb_state_from_devices(devices, target)
+        if last_state == "device":
+            outputs.append(f"ADB Connect OK sau {attempt} lần thử.")
+            if last_connect_output:
+                outputs.append(last_connect_output)
+            outputs.append(last_devices)
+            outputs.append("ADB đã sẵn sàng: device.")
+            return "\n".join(line for line in outputs if line)
+        if last_state == "unauthorized":
+            if last_connect_output:
+                outputs.append(last_connect_output)
+            outputs.append(last_devices)
+            outputs.append("ADB unauthorized: ECU chưa chấp nhận key hoặc key không đúng.")
+            return "\n".join(line for line in outputs if line)
+        if last_state == "offline":
+            for _wait_index in range(10):
+                time.sleep(0.3)
+                code, devices = run(["adb", "devices"], timeout=2, purpose="adb-reconnect-state")
+                last_devices = devices
+                last_state = adb_state_from_devices(devices, target)
+                if last_state == "device":
+                    outputs.append(f"ADB Connect OK sau {attempt} lần thử.")
+                    if last_connect_output:
+                        outputs.append(last_connect_output)
+                    outputs.append(last_devices)
+                    outputs.append("ADB đã sẵn sàng: device.")
+                    return "\n".join(line for line in outputs if line)
+                if last_state == "unauthorized":
+                    if last_connect_output:
+                        outputs.append(last_connect_output)
+                    outputs.append(last_devices)
+                    outputs.append("ADB unauthorized: ECU chưa chấp nhận key hoặc key không đúng.")
+                    return "\n".join(line for line in outputs if line)
+                if last_state != "offline":
+                    break
+            run(["adb", "disconnect", target], timeout=2, purpose="adb-reconnect-disconnect")
+            kill_adb_processes_for_reconnect(target)
+        time.sleep(0.15)
+
+    if ping_seen:
+        outputs.append(f"Ping từng OK: {config['device_ip']}")
+    elif last_ip_error:
+        outputs.append(f"Chưa cấu hình được IP adapter: {last_ip_error}")
+
+    if last_connect_output:
+        outputs.append(last_connect_output)
+    if last_devices:
+        outputs.append(last_devices)
+
+    if last_state == "offline":
+        run(["adb", "disconnect", target], timeout=2, purpose="adb-reconnect-disconnect")
+        killed = kill_adb_processes_for_reconnect(target)
+        if killed:
+            outputs.append(f"Đã dọn {len(killed)} tiến trình ADB offline sau khi thử.")
+        outputs.append("ADB vẫn offline. Bấm ADB Connect lại để app dọn transport cũ và canh tiếp.")
+    elif not ping_seen:
+        outputs.append("Chưa ping được BLTN trong lúc app canh.")
+    elif last_state:
+        outputs.append(f"ADB state hiện tại: {last_state}.")
+    else:
+        outputs.append("ADB chưa thấy thiết bị sau khi connect.")
+
+    outputs.append("Nếu bạn reset BLTN trước khi bấm ADB Connect thì có thể đã lỡ cửa sổ ADB.")
+    outputs.append("Quy trình đúng: bấm ADB Connect trước, thấy app đang canh, rồi reset BLTN.")
+    return "\n".join(line for line in outputs if line)
+
+
+def clean_reset(config, include_current=False):
+    target = adb_target(config)
+    outputs = []
+
+    killed_tracked = cleanup_previous_processes(include_current=include_current)
+    if killed_tracked:
+        outputs.append(f"Đã dọn {len(killed_tracked)} tiến trình do app mở.")
+
+    killed_adb = kill_adb_processes_for_reconnect(target)
+    if killed_adb:
+        outputs.append(f"Đã reset {len(killed_adb)} tiến trình ADB/server cũ.")
+
+    for command in configure_ip_commands(config):
+        code, output = run(command, timeout=5, purpose="clean-reset-ip")
+        append_command_output(outputs, command_text(command), code, output)
+        if code != 0:
+            outputs.append("Reset dừng lại vì chưa cấu hình được IP adapter.")
+            return "\n".join(line for line in outputs if line)
+
+    outputs.append("Reset sạch xong. IP adapter đã được gán lại, ADB server cũ đã được dọn.")
+    outputs.append("Bấm ADB Connect khi ECU/BLTN sẵn sàng.")
+    return "\n".join(line for line in outputs if line)
+
+
+def adb_workdir():
+    for candidate in (APP_DIR, DEFAULT_ADB_WORKDIR, os.path.expanduser("~")):
+        if os.path.isfile(os.path.join(candidate, "adb.sh")):
+            return candidate
+    return APP_DIR
+
+
+def terminal_command(workdir):
+    shell_command = "./adb.sh; exec bash"
+    candidates = [
+        ("ptyxis", ["--new-window", "--working-directory", workdir, "--", "bash", "-lc", shell_command]),
+        ("gnome-terminal", [f"--working-directory={workdir}", "--", "bash", "-lc", shell_command]),
+        ("xfce4-terminal", [f"--working-directory={workdir}", "--command", "bash -lc './adb.sh; exec bash'"]),
+        ("mate-terminal", [f"--working-directory={workdir}", "--", "bash", "-lc", shell_command]),
+        ("konsole", ["--workdir", workdir, "-e", "bash", "-lc", shell_command]),
+        ("lxterminal", ["--working-directory", workdir, "-e", "bash -lc './adb.sh; exec bash'"]),
+        ("x-terminal-emulator", ["-e", "bash", "-lc", shell_command]),
+        ("xterm", ["-e", "bash", "-lc", shell_command]),
+    ]
+    for executable, args in candidates:
+        path = shutil.which(executable)
+        if path:
+            if executable == "x-terminal-emulator" and os.path.basename(os.path.realpath(path)) == "ptyxis":
+                return [
+                    path,
+                    "--new-window",
+                    "--working-directory",
+                    workdir,
+                    "--",
+                    "bash",
+                    "-lc",
+                    shell_command,
+                ]
+            return [path] + args
+    return None
+
+
+def collect_status(config):
+    configured_iface = config["iface"]
+    iface = configured_iface
+    host_cidr = config["host_cidr"]
+    host_ip = host_ip_from_cidr(host_cidr)
+    device_ip = config["device_ip"]
+    target = adb_target(config)
+
+    exists = os.path.exists(f"/sys/class/net/{iface}")
+    detected_iface = None
+    if not exists:
+        detected_iface = detect_usb_iface()
+        if detected_iface:
+            iface = detected_iface
+            exists = os.path.exists(f"/sys/class/net/{iface}")
+
+    carrier = read_file(f"/sys/class/net/{iface}/carrier") if exists else None
+    operstate = read_file(f"/sys/class/net/{iface}/operstate") if exists else "missing"
+
+    _code, ip_output = run(["ip", "-4", "-o", "addr", "show", "dev", iface], timeout=1, purpose="status")
+    has_expected_ip = host_ip in ip_output
+
+    ping_ok = False
+    ping_output = "Bỏ qua vì cổng chưa sẵn sàng."
+    if exists and carrier == "1" and has_expected_ip:
+        ping_code, ping_output = run(
+            ["ping", "-c", "1", "-W", "1", device_ip], timeout=2, purpose="status"
+        )
+        ping_ok = ping_code == 0
+
+    adb_ok = False
+    adb_state = ""
+    adb_output = "Bỏ qua vì cổng chưa có IP."
+    if exists and carrier == "1" and has_expected_ip:
+        if tracked_adb_server_pids():
+            _code, adb_output = run(["adb", "devices"], timeout=2, purpose="status")
+            adb_state = adb_state_from_devices(adb_output, target)
+            adb_ok = adb_state == "device"
+        else:
+            adb_output = "ADB server chưa chạy."
+
+    if not exists:
+        banner = ("CHƯA THẤY ADAPTER", "bad")
+    elif carrier != "1":
+        banner = ("CHƯA CẮM / CHƯA CÓ LINK", "bad")
+    elif not has_expected_ip:
+        banner = (f"CÓ LINK, CHƯA CÓ IP {host_ip} - BẤM ADB CONNECT", "warn")
+    elif adb_ok:
+        banner = ("CONNECTED - ADB READY", "ok")
+    elif not ping_ok:
+        banner = ("ĐANG CHỜ BLTN LÊN MẠNG - BẤM ADB CONNECT ĐỂ CANH", "warn")
+    elif adb_state == "offline":
+        banner = ("ADB OFFLINE CŨ - BẤM ADB CONNECT", "warn")
+    else:
+        banner = ("ADB CHƯA CONNECT - BẤM ADB CONNECT", "warn")
+
+    details = [
+        f"Tên cổng: {iface}",
+        f"Cổng cấu hình: {configured_iface}" if configured_iface != iface else None,
+        f"Trạng thái kết nối cổng: {'Đã kết nối' if carrier == '1' else 'Chưa kết nối'}",
+        f"Adapter tồn tại: {'Có' if exists else 'Không'}",
+        f"Trạng thái OS: {operstate}",
+        f"IP mong muốn: {host_cidr}",
+        f"IP hiện tại: {ip_output if ip_output else 'Chưa có IPv4'}",
+        f"Thiết bị kiểm tra: {device_ip}",
+        f"Ping thiết bị: {'OK' if ping_ok else 'Fail'}",
+        "ADB port: không probe trực tiếp để tránh làm nhiễu adbd",
+        f"ADB target: {target}",
+        f"ADB status: {adb_state or ('device' if adb_ok else 'chưa kết nối')}",
+        f"Gợi ý: {'Bấm ADB Connect để app tự gán IP và canh ADB.' if not adb_ok else 'Có thể bấm Mở Terminal.'}",
+        f"Cập nhật lúc: {time.strftime('%H:%M:%S')}",
+    ]
+    details = [line for line in details if line is not None]
+
+    return {
+        "banner_text": banner[0],
+        "banner_state": banner[1],
+        "details": "\n".join(details),
+        "ping_output": ping_output,
+        "adb_output": adb_output,
+        "adb_ok": adb_ok,
+        "adb_state": adb_state,
+        "exists": exists,
+        "carrier_ok": carrier == "1",
+        "has_expected_ip": has_expected_ip,
+        "ping_ok": ping_ok,
+        "adb_port_open": False,
+        "iface": iface,
+        "configured_iface": configured_iface,
+        "target": target,
+    }
+
+
+class AdapterStatus(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Network Adapter Status")
+        self.set_default_size(820, 640)
+        self.set_size_request(820, 640)
+        self.set_resizable(False)
+        self.set_border_width(18)
+        self.config = load_config()
+        save_config(self.config)
+        cleaned_processes = cleanup_previous_processes(purpose_prefixes=("terminal",))
+        self.poll_running = False
+        self.action_running = False
+        self.last_action = (
+            f"Đã dọn {len(cleaned_processes)} terminal cũ do app mở từ lần trước."
+            if cleaned_processes
+            else "Sẵn sàng. App không tự reset ADB/IP khi mở."
+        )
+
+        css = Gtk.CssProvider()
+        css.load_from_data(
+            b"""
+            window { background: #111827; color: #e5e7eb; }
+            entry { padding: 8px; border-radius: 8px; }
+            .title { font-size: 24px; font-weight: 700; color: #f9fafb; }
+            .subtitle { color: #9ca3af; }
+            .label { color: #cbd5e1; font-weight: 700; }
+            .pill { border-radius: 16px; padding: 14px 16px; font-size: 18px; font-weight: 800; }
+            .ok { background: #065f46; color: #d1fae5; }
+            .warn { background: #92400e; color: #ffedd5; }
+            .bad { background: #7f1d1d; color: #fee2e2; }
+            .card { background: #1f2937; border-radius: 14px; padding: 14px; }
+            textview, textview text { background: #1f2937; color: #e5e7eb; }
+            button { padding: 10px 14px; border-radius: 10px; }
+            button.terminal-ready { background-image: none; background-color: #059669; color: #ecfdf5; font-weight: 700; }
+            button.terminal-wait { color: #6b7280; }
+            """
+        )
+        Gtk.StyleContext.add_provider_for_screen(
+            self.get_screen(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        self.add(root)
+
+        title = Gtk.Label(label="USB Network Adapter")
+        title.set_xalign(0)
+        title.get_style_context().add_class("title")
+        root.pack_start(title, False, False, 0)
+
+        subtitle = Gtk.Label(label=f"Thông số được lưu tại: {CONFIG_FILE}")
+        subtitle.set_xalign(0)
+        subtitle.get_style_context().add_class("subtitle")
+        root.pack_start(subtitle, False, False, 0)
+
+        config_card = Gtk.Grid(column_spacing=10, row_spacing=8)
+        config_card.get_style_context().add_class("card")
+        root.pack_start(config_card, False, False, 0)
+
+        self.iface_entry = self.add_entry(config_card, 0, 0, "Tên cổng", self.config["iface"])
+        self.host_entry = self.add_entry(config_card, 1, 0, "IP adapter", self.config["host_cidr"])
+        self.device_entry = self.add_entry(config_card, 0, 1, "IP thiết bị", self.config["device_ip"])
+        self.port_entry = self.add_entry(config_card, 1, 1, "ADB port", self.config["adb_port"])
+
+        self.banner = Gtk.Label(label="Đang kiểm tra...")
+        self.banner.set_xalign(0.5)
+        self.banner.get_style_context().add_class("pill")
+        root.pack_start(self.banner, False, False, 0)
+
+        self.details_panel, self.details_text = make_text_panel(205, monospace=True)
+        root.pack_start(self.details_panel, False, False, 0)
+
+        buttons = Gtk.Grid(column_spacing=10, row_spacing=8)
+        root.pack_start(buttons, False, False, 0)
+
+        configure = Gtk.Button(label="Cấu hình IP")
+        configure.connect("clicked", self.configure_ip)
+        buttons.attach(configure, 0, 0, 1, 1)
+
+        connect = Gtk.Button(label="ADB Connect")
+        connect.connect("clicked", self.connect_adb)
+        buttons.attach(connect, 1, 0, 1, 1)
+
+        self.open_terminal_button = Gtk.Button(label="Mở Terminal")
+        self.open_terminal_button.set_sensitive(False)
+        self.open_terminal_button.get_style_context().add_class("terminal-wait")
+        self.open_terminal_button.set_tooltip_text("ADB chưa connect.")
+        self.open_terminal_button.connect("clicked", self.open_terminal)
+        buttons.attach(self.open_terminal_button, 2, 0, 1, 1)
+
+        help_button = Gtk.Button(label="Help")
+        help_button.connect("clicked", self.show_help)
+        buttons.attach(help_button, 3, 0, 1, 1)
+
+        for child in buttons.get_children():
+            child.set_hexpand(True)
+
+        self.action_panel, self.action_text = make_text_panel(100, monospace=True)
+        root.pack_start(self.action_panel, False, False, 0)
+        if self.last_action:
+            self.set_action_text(self.last_action)
+
+        GLib.timeout_add_seconds(1, self.refresh_async)
+
+    def add_entry(self, grid, column, row, label_text, value):
+        label = Gtk.Label(label=label_text)
+        label.set_xalign(0)
+        label.get_style_context().add_class("label")
+        grid.attach(label, column * 2, row, 1, 1)
+
+        entry = Gtk.Entry()
+        entry.set_width_chars(20)
+        entry.set_max_width_chars(32)
+        entry.set_hexpand(True)
+        entry.set_text(value)
+        grid.attach(entry, column * 2 + 1, row, 1, 1)
+        return entry
+
+    def current_config(self):
+        config = {
+            "iface": sanitize_iface(self.iface_entry.get_text()),
+            "host_cidr": self.host_entry.get_text().strip() or DEFAULT_CONFIG["host_cidr"],
+            "device_ip": self.device_entry.get_text().strip() or DEFAULT_CONFIG["device_ip"],
+            "adb_port": self.port_entry.get_text().strip() or DEFAULT_CONFIG["adb_port"],
+        }
+        return config
+
+    def set_action_text(self, text):
+        set_text_view(self.action_text, text)
+
+    def set_details_text(self, text):
+        set_text_view(self.details_text, text)
+
+    def store_current_config(self):
+        self.config = self.current_config()
+        if self.iface_entry.get_text().strip() != self.config["iface"]:
+            self.iface_entry.set_text(self.config["iface"])
+        save_config(self.config)
+
+    def save_current_config(self, _button=None):
+        self.store_current_config()
+        self.last_action = "Đã lưu thông số cổng cho lần mở sau."
+        self.set_action_text(self.last_action)
+        self.refresh_async()
+
+    def set_banner(self, text, state):
+        ctx = self.banner.get_style_context()
+        for css_class in ("ok", "warn", "bad"):
+            ctx.remove_class(css_class)
+        ctx.add_class(state)
+        self.banner.set_text(text)
+
+    def configure_ip(self, _button):
+        self.store_current_config()
+        self.run_action("Đang cấu hình IP...", configure_ip_commands(self.config), timeout=5)
+
+    def connect_adb(self, _button):
+        self.store_current_config()
+        self.run_adb_reconnect(self.config)
+
+    def reset_all(self, _button=None):
+        self.store_current_config()
+        self.run_clean_reset(self.config, include_current=True, startup=False)
+
+    def startup_reset(self):
+        self.run_clean_reset(self.current_config(), include_current=False, startup=True)
+        return False
+
+    def run_clean_reset(self, config, include_current=False, startup=False):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        self.action_running = True
+        self.set_banner("ĐANG RESET SẠCH ADB/IP...", "warn")
+        self.set_action_text("Đang dọn ADB cũ và gán lại IP adapter...")
+
+        def worker():
+            message = clean_reset(config, include_current=include_current)
+            if startup:
+                message = f"Reset khi mở app:\n{message}"
+            GLib.idle_add(self.finish_action, message)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def run_adb_reconnect(self, config):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        self.action_running = True
+        self.set_banner("ĐANG CONNECT ADB...", "warn")
+        self.set_action_text("Đang canh ADB trong 60 giây. Có thể reset BLTN ngay bây giờ.")
+
+        def worker():
+            message = adb_reconnect(config)
+            GLib.idle_add(self.finish_action, message)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def open_terminal(self, _button):
+        workdir = adb_workdir()
+        script_path = os.path.join(workdir, "adb.sh")
+        if not os.path.isfile(script_path):
+            message = f"Không thấy script: {script_path}"
+            self.last_action = message
+            self.set_action_text(message)
+            return
+
+        command = terminal_command(workdir)
+        if not command:
+            message = "Không tìm thấy terminal emulator để mở."
+            self.last_action = message
+            self.set_action_text(message)
+            return
+
+        try:
+            env = adb_env()
+            env["ADAPTER_STATUS_TRACK"] = "1"
+            env["ADAPTER_STATUS_RUN_ID"] = APP_RUN_ID
+            env["ADAPTER_STATUS_OWNER_PID"] = str(os.getpid())
+            proc = subprocess.Popen(command, cwd=workdir, env=env, start_new_session=True)
+            register_process(proc.pid, command, "terminal")
+        except Exception as exc:
+            message = f"Không mở được terminal: {exc}"
+        else:
+            message = f"Đã mở terminal tại {workdir} và chạy ./adb.sh"
+        self.last_action = message
+        self.set_action_text(message)
+
+    def run_action(self, start_message, commands, timeout):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        self.action_running = True
+        self.set_banner("ĐANG CHẠY LỆNH...", "warn")
+        self.set_action_text(start_message)
+
+        def worker():
+            outputs = []
+            for command in commands:
+                code, output = run(command, timeout=timeout, purpose="action")
+                if output:
+                    outputs.append(output)
+                if code != 0:
+                    outputs.append(f"Lệnh lỗi ({code}): {' '.join(command)}")
+                    break
+            message = "\n".join(outputs) if outputs else "Đã chạy lệnh."
+            GLib.idle_add(self.finish_action, message)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def finish_action(self, message):
+        self.action_running = False
+        self.last_action = message
+        self.set_action_text(message)
+        self.refresh_async()
+        return False
+
+    def show_help(self, _button):
+        dialog = Gtk.Window(title="Adapter Status Help")
+        dialog.set_transient_for(self)
+        dialog.set_default_size(760, 640)
+        dialog.set_border_width(12)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        dialog.add(root)
+
+        title = Gtk.Label(label="Hướng Dẫn Adapter Status")
+        title.set_xalign(0)
+        title.get_style_context().add_class("title")
+        root.pack_start(title, False, False, 0)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        root.pack_start(scrolled, True, True, 0)
+
+        text_view = Gtk.TextView()
+        text_view.set_editable(False)
+        text_view.set_cursor_visible(False)
+        text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        text_view.set_monospace(False)
+        text_view.get_buffer().set_text(HELP_TEXT)
+        scrolled.add(text_view)
+
+        close_button = Gtk.Button(label="Đóng")
+        close_button.connect("clicked", lambda _button: dialog.destroy())
+        root.pack_start(close_button, False, False, 0)
+
+        dialog.show_all()
+
+    def refresh_async(self):
+        if self.action_running:
+            return True
+        if self.poll_running:
+            return True
+
+        self.poll_running = True
+        config = self.current_config()
+
+        def worker():
+            status = collect_status(config)
+            GLib.idle_add(self.apply_status, status)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def apply_status(self, status):
+        self.poll_running = False
+        self.set_banner(status["banner_text"], status["banner_state"])
+        self.set_terminal_button_ready(status.get("adb_ok", False))
+
+        self.set_details_text(status["details"])
+        return False
+
+    def set_terminal_button_ready(self, ready):
+        self.open_terminal_button.set_sensitive(ready)
+        self.open_terminal_button.set_tooltip_text(
+            "Mở terminal và chạy ./adb.sh" if ready else "ADB chưa connect."
+        )
+        ctx = self.open_terminal_button.get_style_context()
+        for css_class in ("terminal-ready", "terminal-wait"):
+            ctx.remove_class(css_class)
+        ctx.add_class("terminal-ready" if ready else "terminal-wait")
+
+
+if __name__ == "__main__":
+    app = AdapterStatus()
+    app.connect("destroy", Gtk.main_quit)
+    app.show_all()
+    Gtk.main()

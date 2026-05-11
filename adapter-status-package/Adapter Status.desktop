@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Adapter Status
+Comment=Monitor USB network adapter and ADB connection
+Exec=/home/bltn/BLTN_ADB/adapter-status-ui
+Icon=network-wired
+Terminal=false
+Categories=Utility;
