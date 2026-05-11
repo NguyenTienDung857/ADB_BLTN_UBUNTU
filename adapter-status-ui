@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import glob
+import http.server
 import json
 import os
 import posixpath
@@ -35,6 +36,24 @@ DEFAULT_CONFIG = {
 CONNECT_WINDOW_SECONDS = 60.0
 REMOTE_PREVIEW_LIMIT = 32768
 FILE_EXPLORER_TIMEOUT = 10
+VIDEO_STREAM_CHUNK_SIZE = 262144
+VIDEO_EXTENSIONS = (
+    ".mp4",
+    ".m4v",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".ts",
+    ".m2ts",
+    ".webm",
+    ".3gp",
+    ".mpeg",
+    ".mpg",
+    ".h264",
+    ".h265",
+    ".264",
+    ".265",
+)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ADB_WORKDIR = os.path.expanduser("~/BLTN_ADB")
@@ -98,6 +117,8 @@ Tab File Explorer
 - Double-click thư mục để mở, bấm Up để quay lên thư mục cha.
 - Chọn file thường rồi bấm Xem text để đọc tối đa 32768 bytes đầu tiên.
 - Chọn file thường rồi bấm Pull file về máy để tải về thư mục /home/bltn/BLTN_ADB/ecu-files.
+- Chọn file video rồi bấm Mở video trực tiếp để stream qua ADB bằng mpv. App dùng URL local có hỗ trợ seek/range, không tải toàn bộ file trước.
+- Bấm Dừng video để đóng stream nếu cần.
 - Tab này chỉ đọc trên ECU. Không có nút xóa/sửa/push/chmod/remount để tránh làm hỏng build.
 
 Khi nào cần sửa thông số
@@ -830,6 +851,338 @@ def pull_remote_file(config, remote_path):
     return code, output, destination
 
 
+def is_video_path(path):
+    lower = str(path or "").lower()
+    return any(lower.endswith(extension) for extension in VIDEO_EXTENSIONS)
+
+
+def mpv_low_latency_command(remote_path, source="-"):
+    mpv_path = shutil.which("mpv")
+    if not mpv_path:
+        return None
+
+    title = f"ECU Video - {posixpath.basename(normalize_remote_path(remote_path))}"
+    return [
+        mpv_path,
+        "--force-window=yes",
+        "--profile=low-latency",
+        "--cache=no",
+        "--demuxer-readahead-secs=0.1",
+        f"--title={title}",
+        "--",
+        source,
+    ]
+
+
+def terminate_popen(proc, grace_seconds=0.5):
+    if not proc or proc.poll() is not None:
+        return False
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = proc.pid
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            return False
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        time.sleep(0.05)
+
+    if proc.poll() is None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    return True
+
+
+def remote_file_size(config, remote_path):
+    normalized = normalize_remote_path(remote_path)
+    quoted = quote_remote_path(normalized)
+    command = (
+        f"if [ -f {quoted} ]; then "
+        f"stat -c %s {quoted} 2>/dev/null || wc -c < {quoted}; "
+        "else echo '__MISSING_FILE__'; exit 1; fi"
+    )
+    code, output = adb_shell(config, command, timeout=FILE_EXPLORER_TIMEOUT, purpose="file-size")
+    if code != 0:
+        return None, output or f"Không lấy được size: {normalized}"
+
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    if not lines or not re.fullmatch(r"\d+", lines[0]):
+        return None, output or f"Không parse được size: {normalized}"
+    return int(lines[0]), ""
+
+
+def video_content_type(remote_path):
+    lower = str(remote_path or "").lower()
+    if lower.endswith((".mp4", ".m4v")):
+        return "video/mp4"
+    if lower.endswith(".mkv"):
+        return "video/x-matroska"
+    if lower.endswith(".webm"):
+        return "video/webm"
+    if lower.endswith(".ts"):
+        return "video/mp2t"
+    return "application/octet-stream"
+
+
+def parse_http_range(range_header, size):
+    if not range_header:
+        return 200, 0, max(size - 1, 0)
+
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+    if not match:
+        return 200, 0, max(size - 1, 0)
+
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        return 200, 0, max(size - 1, 0)
+
+    if not start_text:
+        suffix = int(end_text)
+        if suffix <= 0:
+            return 416, 0, 0
+        start = max(size - suffix, 0)
+        end = size - 1
+    else:
+        start = int(start_text)
+        end = int(end_text) if end_text else size - 1
+
+    if start >= size or start < 0:
+        return 416, 0, 0
+
+    end = min(end, size - 1)
+    if end < start:
+        return 416, 0, 0
+    return 206, start, end
+
+
+class AdbRangeVideoServer:
+    def __init__(self, config, remote_path, size):
+        self.config = dict(config)
+        self.remote_path = normalize_remote_path(remote_path)
+        self.size = int(size)
+        self.active_processes = set()
+        self.lock = threading.Lock()
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.make_handler())
+        self.httpd.daemon_threads = True
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        host, port = self.httpd.server_address
+        self.url = f"http://{host}:{port}/video"
+
+    def make_handler(self):
+        owner = self
+
+        class VideoRangeHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format, *_args):
+                return
+
+            def do_HEAD(self):
+                self.send_range_headers(send_body=False)
+
+            def do_GET(self):
+                self.send_range_headers(send_body=True)
+
+            def send_range_headers(self, send_body):
+                if self.path.split("?", 1)[0] != "/video":
+                    self.send_error(404)
+                    return
+
+                status, start, end = parse_http_range(self.headers.get("Range"), owner.size)
+                if status == 416:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{owner.size}")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    return
+
+                length = end - start + 1 if owner.size else 0
+                self.send_response(status)
+                self.send_header("Content-Type", video_content_type(owner.remote_path))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(length))
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{owner.size}")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                if send_body and length > 0:
+                    owner.stream_range(self.wfile, start, length)
+
+        return VideoRangeHandler
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        with self.lock:
+            processes = list(self.active_processes)
+        for proc in processes:
+            terminate_popen(proc)
+        try:
+            self.httpd.shutdown()
+        except Exception:
+            pass
+        try:
+            self.httpd.server_close()
+        except Exception:
+            pass
+
+    def stream_range(self, output, start, length):
+        command_text = (
+            f"tail -c +{int(start) + 1} {quote_remote_path(self.remote_path)} 2>/dev/null "
+            f"| head -c {int(length)}"
+        )
+        command = ["adb", "-s", adb_target(self.config), "exec-out", "sh", "-c", command_text]
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=adb_env(),
+                start_new_session=True,
+            )
+            register_process(proc.pid, command, "video-stream-range-adb")
+            with self.lock:
+                self.active_processes.add(proc)
+
+            remaining = int(length)
+            while remaining > 0:
+                chunk = proc.stdout.read(min(VIDEO_STREAM_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                output.write(chunk)
+                remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            if proc:
+                if proc.stdout:
+                    try:
+                        proc.stdout.close()
+                    except OSError:
+                        pass
+                terminate_popen(proc)
+                unregister_process(proc.pid)
+                with self.lock:
+                    self.active_processes.discard(proc)
+
+
+def start_remote_video_stream(config, remote_path):
+    normalized = normalize_remote_path(remote_path)
+    if not is_video_path(normalized):
+        return {
+            "ok": False,
+            "path": normalized,
+            "message": f"Không nhận diện là file video: {normalized}",
+            "processes": {},
+        }
+
+    if not shutil.which("mpv"):
+        return {
+            "ok": False,
+            "path": normalized,
+            "message": (
+                "Máy chưa có mpv nên chưa mở video trực tiếp được.\n"
+                "Cài bằng: sudo apt-get install -y mpv"
+            ),
+            "processes": {},
+        }
+
+    state, devices_output = ensure_adb_device(config)
+    if state != "device":
+        return {
+            "ok": False,
+            "path": normalized,
+            "message": (
+                f"ADB chưa sẵn sàng cho {adb_target(config)}. State: {state or 'not connected'}\n"
+                f"{devices_output}"
+            ).strip(),
+            "processes": {},
+        }
+
+    size, size_error = remote_file_size(config, normalized)
+    if not size:
+        return {
+            "ok": False,
+            "path": normalized,
+            "message": (
+                f"Không lấy được size hoặc file không còn tồn tại:\n{normalized}\n"
+                f"{size_error}"
+            ).strip(),
+            "processes": {},
+        }
+
+    cleanup_previous_processes(include_current=True, purpose_prefixes=("video-stream",))
+    range_server = None
+    mpv_proc = None
+    try:
+        range_server = AdbRangeVideoServer(config, normalized, size)
+        range_server.start()
+        mpv_command = mpv_low_latency_command(normalized, source=range_server.url)
+
+        mpv_proc = subprocess.Popen(
+            mpv_command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        register_process(mpv_proc.pid, mpv_command, "video-stream-mpv")
+
+        time.sleep(0.8)
+        if mpv_proc.poll() is not None:
+            range_server.stop()
+            cleanup_previous_processes(include_current=True, purpose_prefixes=("video-stream",))
+            return {
+                "ok": False,
+                "path": normalized,
+                "message": (
+                    "mpv đã thoát ngay sau khi mở stream range. File có thể lỗi, bị xóa, "
+                    "hoặc không đọc được qua ADB."
+                ),
+                "processes": {},
+            }
+
+    except Exception as exc:
+        if range_server:
+            range_server.stop()
+        cleanup_previous_processes(include_current=True, purpose_prefixes=("video-stream",))
+        return {
+            "ok": False,
+            "path": normalized,
+            "message": f"Không mở được video trực tiếp: {exc}",
+            "processes": {},
+        }
+
+    return {
+        "ok": True,
+        "path": normalized,
+        "message": (
+            f"Đang stream trực tiếp qua ADB:\n{normalized}\n\n"
+            f"Size: {human_size(size)}\n"
+            f"URL local có hỗ trợ seek/range: {range_server.url}\n"
+            "Backend chỉ đọc byte-range cần thiết từ ECU qua ADB, không tải toàn bộ file trước."
+        ),
+        "processes": {"player": mpv_proc},
+        "server": range_server,
+    }
+
+
 def append_command_output(outputs, label, code, output):
     if output:
         outputs.append(output)
@@ -1129,7 +1482,12 @@ class AdapterStatus(Gtk.Window):
         self.poll_running = False
         self.action_running = False
         self.file_running = False
+        self.video_running = False
+        self.video_session_id = 0
         self.selected_remote_item = None
+        self.video_processes = {}
+        self.video_server = None
+        self.connect("destroy", self.cleanup_video_on_destroy)
         self.last_action = (
             f"Đã dọn {len(cleaned_processes)} terminal cũ do app mở từ lần trước."
             if cleaned_processes
@@ -1260,8 +1618,8 @@ class AdapterStatus(Gtk.Window):
 
         note = Gtk.Label(
             label=(
-                "Duyệt file/thư mục qua ADB. App chỉ đọc trên ECU; nút Pull chỉ tải file về "
-                f"{os.path.join(adb_workdir(), 'ecu-files')}."
+                "Duyệt file/thư mục qua ADB. App chỉ đọc trên ECU; Pull tải file về "
+                f"{os.path.join(adb_workdir(), 'ecu-files')}. Video được stream trực tiếp bằng mpv."
             )
         )
         note.set_xalign(0)
@@ -1332,6 +1690,14 @@ class AdapterStatus(Gtk.Window):
         self.pull_button.connect("clicked", self.pull_selected_remote_file)
         actions.pack_start(self.pull_button, False, False, 0)
 
+        self.video_button = Gtk.Button(label="Mở video trực tiếp")
+        self.video_button.connect("clicked", self.open_selected_remote_video)
+        actions.pack_start(self.video_button, False, False, 0)
+
+        self.stop_video_button = Gtk.Button(label="Dừng video")
+        self.stop_video_button.connect("clicked", self.stop_remote_video)
+        actions.pack_start(self.stop_video_button, False, False, 0)
+
         self.copy_path_button = Gtk.Button(label="Copy path")
         self.copy_path_button.connect("clicked", self.copy_selected_remote_path)
         actions.pack_start(self.copy_path_button, False, False, 0)
@@ -1340,7 +1706,7 @@ class AdapterStatus(Gtk.Window):
         page.pack_start(self.file_info_panel, False, False, 0)
         self.set_file_info_text(
             "Bấm Refresh để đọc thư mục /. Double-click thư mục để mở.\n"
-            "ADB phải ở trạng thái device trước khi duyệt file."
+            "ADB phải ở trạng thái device trước khi duyệt file hoặc mở video."
         )
         self.update_file_buttons()
         self.current_remote_path = "/"
@@ -1379,6 +1745,7 @@ class AdapterStatus(Gtk.Window):
         has_item = item is not None
         is_directory_like = has_item and (item.get("is_dir") or item.get("kind") == "Liên kết")
         is_regular_file = has_item and item.get("kind") == "File"
+        is_video_file = is_regular_file and is_video_path(item.get("path", ""))
 
         if hasattr(self, "open_remote_button"):
             self.open_remote_button.set_sensitive(bool(is_directory_like) and not self.file_running)
@@ -1386,6 +1753,10 @@ class AdapterStatus(Gtk.Window):
             self.preview_button.set_sensitive(bool(is_regular_file) and not self.file_running)
         if hasattr(self, "pull_button"):
             self.pull_button.set_sensitive(bool(is_regular_file) and not self.file_running)
+        if hasattr(self, "video_button"):
+            self.video_button.set_sensitive(bool(is_video_file) and not self.file_running)
+        if hasattr(self, "stop_video_button"):
+            self.stop_video_button.set_sensitive(self.video_running)
         if hasattr(self, "copy_path_button"):
             self.copy_path_button.set_sensitive(has_item)
 
@@ -1416,7 +1787,11 @@ class AdapterStatus(Gtk.Window):
                 f"Owner/Group: {item['owner_group']}",
                 f"Sửa lúc: {item['modified']}",
                 "",
-                "Double-click thư mục để mở. File thường có thể Xem text hoặc Pull về máy.",
+                (
+                    "Đây là file video: có thể bấm Mở video trực tiếp."
+                    if item.get("kind") == "File" and is_video_path(item["path"])
+                    else "Double-click thư mục để mở. File thường có thể Xem text hoặc Pull về máy."
+                ),
             ]
         )
 
@@ -1575,6 +1950,98 @@ class AdapterStatus(Gtk.Window):
 
         threading.Thread(target=worker, daemon=True).start()
         return True
+
+    def open_selected_remote_video(self, _button):
+        item = self.selected_remote_item
+        if not item or item.get("kind") != "File" or not is_video_path(item.get("path", "")):
+            self.set_file_info_text("Chỉ mở trực tiếp file video được nhận diện theo đuôi file.")
+            return False
+        if self.file_running:
+            self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        self.store_current_config()
+        self.file_running = True
+        self.video_running = False
+        self.video_session_id += 1
+        session_id = self.video_session_id
+        self.update_file_buttons()
+        self.set_file_info_text(f"Đang mở video trực tiếp qua ADB:\n{item['path']}")
+        config = dict(self.config)
+        remote_path = item["path"]
+
+        def worker():
+            result = start_remote_video_stream(config, remote_path)
+            GLib.idle_add(self.finish_video_start, result, session_id)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def finish_video_start(self, result, session_id):
+        if session_id != self.video_session_id:
+            return False
+
+        self.file_running = False
+        if result.get("ok"):
+            self.video_running = True
+            self.video_processes = result.get("processes", {})
+            self.video_server = result.get("server")
+            self.set_file_info_text(result.get("message", "Đã mở video trực tiếp."))
+            threading.Thread(
+                target=self.watch_video_stream,
+                args=(session_id, self.video_processes, self.video_server, result.get("path", "")),
+                daemon=True,
+            ).start()
+        else:
+            self.video_running = False
+            self.video_processes = {}
+            self.video_server = None
+            self.set_file_info_text(result.get("message", "Không mở được video trực tiếp."))
+
+        self.update_file_buttons()
+        return False
+
+    def watch_video_stream(self, session_id, processes, video_server, remote_path):
+        player_proc = processes.get("player")
+        if player_proc:
+            try:
+                player_proc.wait()
+            except Exception:
+                pass
+
+        if video_server:
+            video_server.stop()
+
+        GLib.idle_add(self.finish_video_stream, session_id, remote_path)
+
+    def finish_video_stream(self, session_id, remote_path):
+        if session_id != self.video_session_id:
+            return False
+        self.video_running = False
+        self.video_processes = {}
+        self.video_server = None
+        self.update_file_buttons()
+        self.set_file_info_text(f"Video đã đóng hoặc stream đã dừng:\n{remote_path}")
+        return False
+
+    def stop_remote_video(self, _button=None):
+        killed = cleanup_previous_processes(include_current=True, purpose_prefixes=("video-stream",))
+        if self.video_server:
+            self.video_server.stop()
+        for proc in self.video_processes.values():
+            terminate_popen(proc)
+        self.video_running = False
+        self.video_processes = {}
+        self.video_server = None
+        self.video_session_id += 1
+        self.update_file_buttons()
+        message = f"Đã dừng {len(killed)} tiến trình video stream." if killed else "Không có video stream đang chạy."
+        self.set_file_info_text(message)
+        return False
+
+    def cleanup_video_on_destroy(self, _window):
+        if self.video_running or self.video_processes:
+            self.stop_remote_video()
 
     def copy_selected_remote_path(self, _button):
         item = self.selected_remote_item

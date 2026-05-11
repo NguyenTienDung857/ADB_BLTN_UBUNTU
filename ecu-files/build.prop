@@ -1,4 +1,0 @@
-service.adb.root=1
-service.adb.tcp.port=4321
-ro.debuggable=1
-ro.secure=0
