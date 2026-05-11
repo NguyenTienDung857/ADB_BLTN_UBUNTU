@@ -376,7 +376,31 @@ Chỉ sáng khi app thấy ADB đã lên `device`. Khi bấm, app mở terminal 
 
 Mở cửa sổ hướng dẫn chi tiết ngay trong app.
 
-## 14. Quy Trình Khi Rút/Cắm Lại Cổng
+## 14. Tab File Explorer
+
+Tab **File Explorer** dùng để xem cây file/thư mục của ECU qua ADB theo cách trực quan hơn terminal.
+
+Điều kiện:
+
+- App phải thấy `ADB status: device`.
+- Nếu chưa thấy `device`, bấm **ADB Connect** trước.
+
+Cách dùng:
+
+- Nhập đường dẫn như `/`, `/etc`, `/data`, `/firmware` rồi bấm **Refresh** hoặc Enter.
+- Double-click thư mục để mở.
+- Bấm **Up** để quay lên thư mục cha.
+- Chọn file thường rồi bấm **Xem text** để preview tối đa 32768 bytes đầu tiên.
+- Chọn file thường rồi bấm **Pull file về máy** để tải về `~/BLTN_ADB/ecu-files`.
+- Bấm **Copy path** để copy đường dẫn file/thư mục đang chọn.
+
+Giới hạn an toàn:
+
+- Tab này chỉ đọc trên ECU.
+- Không có thao tác xóa, sửa, push, chmod hoặc remount.
+- File binary chỉ nên pull về máy, không nên preview trực tiếp.
+
+## 15. Quy Trình Khi Rút/Cắm Lại Cổng
 
 1. Mở app **Adapter Status**.
 2. Rút hoặc cắm lại cổng USB Network Adapter.
@@ -385,7 +409,7 @@ Mở cửa sổ hướng dẫn chi tiết ngay trong app.
 5. Nếu cửa sổ ADB quá ngắn, bấm **ADB Connect** trước rồi reset BLTN khi app đang canh.
 6. Khi thấy `CONNECTED - ADB READY`, bấm **Mở Terminal** hoặc dùng ADB bình thường.
 
-## 15. Nếu Tên Cổng Bị Đổi
+## 16. Nếu Tên Cổng Bị Đổi
 
 Xem danh sách cổng:
 
@@ -408,7 +432,7 @@ Nếu tên khác với app:
 
 `adb.sh` cũng có cơ chế tự dò cổng `enx...` nếu cổng trong config không tồn tại.
 
-## 16. Xử Lý Lỗi Thường Gặp
+## 17. Xử Lý Lỗi Thường Gặp
 
 ### Lỗi `No such device`
 
@@ -529,7 +553,7 @@ Hoặc dùng app:
 2. Bấm **Cấu hình IP**.
 3. Kiểm tra lại ping trên app.
 
-## 17. Lệnh Kiểm Tra Nhanh
+## 18. Lệnh Kiểm Tra Nhanh
 
 Kiểm tra cổng:
 
@@ -574,7 +598,7 @@ cd ~/BLTN_ADB
 ./adb.sh
 ```
 
-## 18. Quy Trình Chuẩn Hằng Ngày
+## 19. Quy Trình Chuẩn Hằng Ngày
 
 1. Cắm USB Network Adapter vào thiết bị.
 2. Mở app **Adapter Status**.
@@ -588,7 +612,7 @@ cd ~/BLTN_ADB
 ./adb.sh
 ```
 
-## 19. Ghi Chú Quan Trọng
+## 20. Ghi Chú Quan Trọng
 
 - Luôn kiểm tra app trước khi chạy `adb shell`.
 - Nếu app chưa báo `CONNECTED - ADB READY`, nên xử lý trạng thái trên app trước.
