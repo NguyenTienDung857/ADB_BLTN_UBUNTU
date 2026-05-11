@@ -387,9 +387,14 @@ Tab **File Explorer** dùng để xem cây file/thư mục của ECU qua ADB the
 
 Cách dùng:
 
-- Nhập đường dẫn như `/`, `/etc`, `/data`, `/firmware` rồi bấm **Refresh** hoặc Enter.
+- Khi bấm tab **File Explorer** và ADB đang là `device`, app tự **Refresh** đường dẫn hiện tại.
+- Khi ADB đang là `device`, app tự đồng bộ lại thư mục hiện tại mỗi 30 giây để UI có file/thư mục mới nhất.
+- Có thể nhập đường dẫn như `/`, `/etc`, `/data`, `/firmware` rồi bấm **Refresh** hoặc Enter.
 - Double-click thư mục để mở.
 - Bấm **Up** để quay lên thư mục cha.
+- File/thư mục có icon nhận diện nhanh: thư mục, ảnh, video, text/log, database và file thường.
+- Có thể bấm tiêu đề cột **Tên**, **Loại**, **Size** hoặc **Sửa lúc** để đổi sort nhanh.
+- Bấm **Focus** để ẩn phần phụ, chỉ giữ vùng file/thư mục lớn và thanh **Up** / đường dẫn / **Thoát focus**.
 - Chọn file thường rồi bấm **Xem text** để preview tối đa 32768 bytes đầu tiên.
 - Chọn file thường rồi bấm **Pull file về máy** để tải về `~/BLTN_ADB/ecu-files`.
 - Chọn file ảnh rồi bấm **Xem ảnh**, hoặc double-click file ảnh để mở ảnh trực tiếp qua ADB.

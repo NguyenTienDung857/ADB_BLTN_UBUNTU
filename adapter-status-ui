@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
 CONNECT_WINDOW_SECONDS = 60.0
 REMOTE_PREVIEW_LIMIT = 32768
 FILE_EXPLORER_TIMEOUT = 10
+FILE_EXPLORER_AUTO_REFRESH_SECONDS = 30
 VIDEO_STREAM_CHUNK_SIZE = 262144
 IMAGE_PREVIEW_MAX_BYTES = 50 * 1024 * 1024
 IMAGE_PREVIEW_MAX_WIDTH = 1200
@@ -67,6 +68,45 @@ VIDEO_EXTENSIONS = (
     ".264",
     ".265",
 )
+TEXT_EXTENSIONS = (
+    ".txt",
+    ".log",
+    ".dlt",
+    ".conf",
+    ".cfg",
+    ".ini",
+    ".json",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".csv",
+    ".sh",
+    ".rc",
+)
+DATABASE_EXTENSIONS = (
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+)
+FILE_LIST_ICON_SIZE = 24
+FILE_GRID_ICON_DEFAULT_SIZE = 88
+
+FILE_COL_LIST_ICON = 0
+FILE_COL_GRID_ICON = 1
+FILE_COL_NAME = 2
+FILE_COL_GRID_LABEL = 3
+FILE_COL_KIND_LABEL = 4
+FILE_COL_SIZE_TEXT = 5
+FILE_COL_PERMISSIONS = 6
+FILE_COL_OWNER_GROUP = 7
+FILE_COL_MODIFIED = 8
+FILE_COL_PATH = 9
+FILE_COL_IS_DIR = 10
+FILE_COL_SIZE = 11
+FILE_COL_GROUP = 12
+FILE_COL_KIND = 13
+FILE_COL_LINK_TARGET = 14
+FILE_COL_ICON_NAME = 15
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ADB_WORKDIR = os.path.expanduser("~/BLTN_ADB")
@@ -126,8 +166,13 @@ Các nút thao tác
 
 Tab File Explorer
 - Chỉ dùng khi ADB status là device.
-- Bấm tab File Explorer, nhập đường dẫn như /, /etc, /data, /firmware rồi bấm Refresh hoặc Enter.
+- Khi bấm tab File Explorer và ADB đang là device, app tự Refresh đường dẫn hiện tại.
+- Khi ADB đang là device, app tự đồng bộ lại thư mục hiện tại mỗi 30 giây.
+- Có thể nhập đường dẫn như /, /etc, /data, /firmware rồi bấm Refresh hoặc Enter.
 - Double-click thư mục để mở, bấm Up để quay lên thư mục cha.
+- File/thư mục có icon nhận diện nhanh: thư mục, ảnh, video, text/log, database và file thường.
+- Có thể bấm tiêu đề cột Tên/Loại/Size/Sửa lúc để đổi sort nhanh.
+- Bấm Focus để ẩn phần phụ, chỉ giữ vùng file/thư mục lớn và thanh Up/đường dẫn/Thoát focus.
 - Chọn file thường rồi bấm Xem text để đọc tối đa 32768 bytes đầu tiên.
 - Chọn file thường rồi bấm Pull file về máy để tải về thư mục /home/bltn/BLTN_ADB/ecu-files.
 - Chọn file ảnh rồi bấm Xem ảnh, hoặc double-click file ảnh để mở ảnh trực tiếp qua ADB.
@@ -990,6 +1035,114 @@ def is_video_path(path):
     return any(lower.endswith(extension) for extension in VIDEO_EXTENSIONS)
 
 
+def is_text_path(path):
+    lower = str(path or "").lower()
+    return any(lower.endswith(extension) for extension in TEXT_EXTENSIONS)
+
+
+def is_database_path(path):
+    lower = str(path or "").lower()
+    return any(lower.endswith(extension) for extension in DATABASE_EXTENSIONS)
+
+
+def remote_item_display_name(item):
+    return item.get("path_name") or item.get("name") or posixpath.basename(item.get("path", ""))
+
+
+def remote_item_kind_label(item):
+    if item.get("is_dir"):
+        return "Thư mục"
+    if item.get("is_link"):
+        return "Liên kết"
+
+    kind = item.get("kind", "File")
+    path = item.get("path", "")
+    if kind != "File":
+        return kind
+    if is_image_path(path):
+        return "Ảnh"
+    if is_video_path(path):
+        return "Video"
+    if is_database_path(path):
+        return "Database"
+    if is_text_path(path):
+        return "Text/Log"
+    return "File"
+
+
+def remote_item_icon_name(item):
+    if item.get("is_dir"):
+        return "folder"
+    if item.get("is_link"):
+        return "emblem-symbolic-link"
+
+    kind = item.get("kind", "File")
+    path = item.get("path", "")
+    if kind in ("Char device", "Block device"):
+        return "drive-harddisk"
+    if kind == "Socket":
+        return "network-server"
+    if kind == "Pipe":
+        return "media-playback-pause"
+    if is_image_path(path):
+        return "image-x-generic"
+    if is_video_path(path):
+        return "video-x-generic"
+    if is_database_path(path):
+        return "x-office-spreadsheet"
+    if is_text_path(path):
+        return "text-x-generic"
+    return "application-octet-stream"
+
+
+def remote_item_grid_label(item):
+    name = remote_item_display_name(item)
+    if item.get("is_dir") or item.get("is_link"):
+        return name
+    size_text = item.get("size_text")
+    return f"{name}\n{size_text}" if size_text else name
+
+
+def modified_sort_value(modified):
+    text = str(modified or "").strip()
+    if not text:
+        return (1, "")
+
+    iso_match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}(?::\d{2})?)", text)
+    if iso_match:
+        date_text, time_text = iso_match.groups()
+        if len(time_text) == 5:
+            time_text = f"{time_text}:00"
+        return (0, f"{date_text} {time_text}")
+
+    current_year = time.localtime().tm_year
+    for fmt, inject_year in (("%b %d %H:%M", True), ("%b %d %Y", False)):
+        try:
+            parsed = time.strptime(text, fmt)
+        except ValueError:
+            continue
+        year = current_year if inject_year else parsed.tm_year
+        return (
+            0,
+            f"{year:04d}-{parsed.tm_mon:02d}-{parsed.tm_mday:02d} "
+            f"{parsed.tm_hour:02d}:{parsed.tm_min:02d}:00",
+        )
+
+    return (1, text.lower())
+
+
+def remote_entry_sort_key(item, sort_id):
+    name = remote_item_display_name(item).lower()
+    kind_label = remote_item_kind_label(item).lower()
+    if sort_id == "type":
+        return (kind_label, name)
+    if sort_id == "size":
+        return (int(item.get("size") or 0), name)
+    if sort_id == "modified":
+        return (modified_sort_value(item.get("modified")), name)
+    return (name,)
+
+
 def mpv_low_latency_command(remote_path, source="-"):
     mpv_path = shutil.which("mpv")
     if not mpv_path:
@@ -1619,8 +1772,17 @@ class AdapterStatus(Gtk.Window):
         self.video_running = False
         self.video_session_id = 0
         self.selected_remote_item = None
+        self.remote_entries = []
+        self.file_icon_cache = {}
+        self.file_grid_icon_size = FILE_GRID_ICON_DEFAULT_SIZE
+        self.file_focus_mode = False
+        self.file_sort_id = "name"
+        self.file_sort_desc = False
+        self.file_dirs_first = True
+        self.syncing_file_selection = False
         self.video_processes = {}
         self.video_server = None
+        self.last_status = {}
         self.connect("destroy", self.cleanup_video_on_destroy)
         self.last_action = (
             f"Đã dọn {len(cleaned_processes)} terminal cũ do app mở từ lần trước."
@@ -1641,11 +1803,16 @@ class AdapterStatus(Gtk.Window):
             .warn { background: #92400e; color: #ffedd5; }
             .bad { background: #7f1d1d; color: #fee2e2; }
             .card { background: #1f2937; border-radius: 14px; padding: 14px; }
+            .file-focus-bar { background: #0f172a; border-radius: 8px; padding: 3px 6px; }
+            .file-focus-path { color: #cbd5e1; font-size: 12px; }
             textview, textview text { background: #1f2937; color: #e5e7eb; }
             treeview { background: #111827; color: #e5e7eb; }
             treeview.view:selected { background: #2563eb; color: #f8fafc; }
+            iconview { background: #111827; color: #e5e7eb; }
+            iconview.view:selected { background: #2563eb; color: #f8fafc; border-radius: 10px; }
             notebook tab { padding: 8px 14px; }
             button { padding: 10px 14px; border-radius: 10px; }
+            button.compact-button { padding: 2px 8px; border-radius: 7px; }
             button.terminal-ready { background-image: none; background-color: #059669; color: #ecfdf5; font-weight: 700; }
             button.terminal-wait { color: #6b7280; }
             """
@@ -1657,14 +1824,15 @@ class AdapterStatus(Gtk.Window):
         window_root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(window_root)
 
-        notebook = Gtk.Notebook()
-        notebook.set_hexpand(True)
-        notebook.set_vexpand(True)
-        window_root.pack_start(notebook, True, True, 0)
+        self.notebook = Gtk.Notebook()
+        self.notebook.set_hexpand(True)
+        self.notebook.set_vexpand(True)
+        self.notebook.connect("switch-page", self.on_notebook_switch_page)
+        window_root.pack_start(self.notebook, True, True, 0)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         root.set_border_width(4)
-        notebook.append_page(root, Gtk.Label(label="Trạng thái ADB"))
+        self.notebook.append_page(root, Gtk.Label(label="Trạng thái ADB"))
 
         title = Gtk.Label(label="USB Network Adapter")
         title.set_xalign(0)
@@ -1723,9 +1891,13 @@ class AdapterStatus(Gtk.Window):
         if self.last_action:
             self.set_action_text(self.last_action)
 
-        notebook.append_page(self.build_file_explorer_page(), Gtk.Label(label="File Explorer"))
+        self.file_explorer_page = self.build_file_explorer_page()
+        self.file_explorer_page_num = self.notebook.append_page(
+            self.file_explorer_page, Gtk.Label(label="File Explorer")
+        )
 
         GLib.timeout_add_seconds(1, self.refresh_async)
+        GLib.timeout_add_seconds(FILE_EXPLORER_AUTO_REFRESH_SECONDS, self.periodic_file_explorer_refresh)
 
     def add_entry(self, grid, column, row, label_text, value):
         label = Gtk.Label(label=label_text)
@@ -1741,6 +1913,55 @@ class AdapterStatus(Gtk.Window):
         grid.attach(entry, column * 2 + 1, row, 1, 1)
         return entry
 
+    def on_notebook_switch_page(self, _notebook, _page, page_num):
+        if page_num == getattr(self, "file_explorer_page_num", -1):
+            GLib.idle_add(self.auto_refresh_file_explorer)
+        return False
+
+    def adb_ready_for_file_refresh(self):
+        status = getattr(self, "last_status", {})
+        return bool(status.get("adb_ok") or status.get("adb_state") == "device")
+
+    def periodic_file_explorer_refresh(self):
+        if self.file_running or not self.adb_ready_for_file_refresh():
+            return True
+        if hasattr(self, "remote_path_entry") and self.remote_path_entry.has_focus():
+            return True
+
+        self.load_remote_dir(
+            getattr(self, "current_remote_path", "/"),
+            preserve_selection=True,
+            quiet=True,
+        )
+        return True
+
+    def auto_refresh_file_explorer(self):
+        if self.file_running:
+            return False
+
+        if self.adb_ready_for_file_refresh():
+            self.load_remote_dir(self.remote_path_entry.get_text() or self.current_remote_path)
+            return False
+
+        config = self.current_config()
+        self.set_file_info_text("Đang kiểm tra ADB để tự refresh File Explorer...")
+
+        def worker():
+            state, _devices_output = ensure_adb_device(config)
+            GLib.idle_add(self.finish_file_explorer_auto_refresh_check, state)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return False
+
+    def finish_file_explorer_auto_refresh_check(self, state):
+        if state == "device":
+            self.load_remote_dir(self.remote_path_entry.get_text() or self.current_remote_path)
+        else:
+            self.set_file_info_text(
+                f"ADB chưa ở trạng thái device nên chưa tự refresh File Explorer. State: {state or 'not connected'}"
+            )
+        return False
+
     def build_file_explorer_page(self):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         page.set_border_width(4)
@@ -1749,6 +1970,7 @@ class AdapterStatus(Gtk.Window):
         title.set_xalign(0)
         title.get_style_context().add_class("title")
         page.pack_start(title, False, False, 0)
+        self.file_title = title
 
         note = Gtk.Label(
             label=(
@@ -1760,9 +1982,11 @@ class AdapterStatus(Gtk.Window):
         note.get_style_context().add_class("subtitle")
         constrain_label_width(note, max_width_chars=120)
         page.pack_start(note, False, False, 0)
+        self.file_note = note
 
         nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         page.pack_start(nav, False, False, 0)
+        self.file_nav = nav
 
         self.remote_path_entry = Gtk.Entry()
         self.remote_path_entry.set_text("/")
@@ -1782,23 +2006,70 @@ class AdapterStatus(Gtk.Window):
         refresh_button.connect("clicked", self.browse_remote_path)
         nav.pack_start(refresh_button, False, False, 0)
 
+        self.file_focus_toggle = Gtk.ToggleButton(label="Focus")
+        self.file_focus_toggle.set_tooltip_text("Ẩn phần phụ để vùng file/thư mục rộng hơn.")
+        self.file_focus_toggle.connect("toggled", self.on_file_focus_toggled)
+        nav.pack_start(self.file_focus_toggle, False, False, 0)
+
         self.file_count_label = Gtk.Label(label="Chưa đọc thư mục.")
         self.file_count_label.set_xalign(0)
         self.file_count_label.get_style_context().add_class("subtitle")
         page.pack_start(self.file_count_label, False, False, 0)
 
-        self.file_store = Gtk.ListStore(str, str, str, str, str, str, str, bool, int, str)
+        self.file_focus_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.file_focus_bar.get_style_context().add_class("file-focus-bar")
+        self.file_focus_bar.set_no_show_all(True)
+        page.pack_start(self.file_focus_bar, False, False, 0)
+
+        focus_up_button = Gtk.Button(label="↑")
+        focus_up_button.set_tooltip_text("Lên thư mục cha")
+        focus_up_button.get_style_context().add_class("compact-button")
+        focus_up_button.connect("clicked", self.go_remote_parent)
+        self.file_focus_bar.pack_start(focus_up_button, False, False, 0)
+
+        self.file_focus_path_label = Gtk.Label(label="/")
+        self.file_focus_path_label.set_xalign(0)
+        self.file_focus_path_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.file_focus_path_label.set_hexpand(True)
+        self.file_focus_path_label.get_style_context().add_class("file-focus-path")
+        self.file_focus_bar.pack_start(self.file_focus_path_label, True, True, 0)
+
+        self.file_focus_exit_button = Gtk.Button(label="Thoát")
+        self.file_focus_exit_button.set_tooltip_text("Thoát chế độ Focus")
+        self.file_focus_exit_button.get_style_context().add_class("compact-button")
+        self.file_focus_exit_button.connect("clicked", self.disable_file_focus)
+        self.file_focus_bar.pack_start(self.file_focus_exit_button, False, False, 0)
+
+        self.file_store = Gtk.ListStore(
+            GdkPixbuf.Pixbuf,
+            GdkPixbuf.Pixbuf,
+            str,
+            str,
+            str,
+            str,
+            str,
+            str,
+            str,
+            str,
+            bool,
+            int,
+            str,
+            str,
+            str,
+            str,
+        )
         self.file_tree = Gtk.TreeView(model=self.file_store)
         self.file_tree.set_headers_visible(True)
+        self.file_tree.set_search_column(FILE_COL_NAME)
         self.file_tree.connect("row-activated", self.open_remote_row)
         self.file_tree.get_selection().connect("changed", self.on_remote_selection_changed)
 
-        self.add_file_column(self.file_tree, "Tên", 0, expand=True, width=320)
-        self.add_file_column(self.file_tree, "Loại", 1, width=100)
-        self.add_file_column(self.file_tree, "Size", 2, width=90)
-        self.add_file_column(self.file_tree, "Quyền", 3, width=110)
-        self.add_file_column(self.file_tree, "Owner/Group", 4, width=130)
-        self.add_file_column(self.file_tree, "Sửa lúc", 5, width=150)
+        self.add_file_name_column(self.file_tree)
+        self.add_file_column(self.file_tree, "Loại", FILE_COL_KIND_LABEL, sort_id="type", width=110)
+        self.add_file_column(self.file_tree, "Size", FILE_COL_SIZE_TEXT, sort_id="size", width=90)
+        self.add_file_column(self.file_tree, "Quyền", FILE_COL_PERMISSIONS, width=110)
+        self.add_file_column(self.file_tree, "Owner/Group", FILE_COL_OWNER_GROUP, width=130)
+        self.add_file_column(self.file_tree, "Sửa lúc", FILE_COL_MODIFIED, sort_id="modified", width=150)
 
         tree_scrolled = Gtk.ScrolledWindow()
         tree_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -1806,10 +2077,49 @@ class AdapterStatus(Gtk.Window):
         tree_scrolled.set_vexpand(True)
         tree_scrolled.get_style_context().add_class("card")
         tree_scrolled.add(self.file_tree)
-        page.pack_start(tree_scrolled, True, True, 0)
+
+        self.file_grid = Gtk.IconView(model=self.file_store)
+        self.file_grid.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.file_grid.set_margin(12)
+        self.file_grid.set_spacing(12)
+        self.file_grid.set_row_spacing(16)
+        self.file_grid.set_column_spacing(18)
+        self.file_grid.connect("item-activated", self.open_remote_grid_item)
+        self.file_grid.connect("selection-changed", self.on_remote_grid_selection_changed)
+
+        grid_icon_renderer = Gtk.CellRendererPixbuf()
+        grid_icon_renderer.set_property("xalign", 0.5)
+        self.file_grid.pack_start(grid_icon_renderer, False)
+        self.file_grid.add_attribute(grid_icon_renderer, "pixbuf", FILE_COL_GRID_ICON)
+
+        self.file_grid_text_renderer = Gtk.CellRendererText()
+        self.file_grid_text_renderer.set_property("xalign", 0.5)
+        self.file_grid_text_renderer.set_property("wrap-mode", Pango.WrapMode.WORD_CHAR)
+        self.file_grid_text_renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+        self.file_grid.pack_start(self.file_grid_text_renderer, False)
+        self.file_grid.add_attribute(self.file_grid_text_renderer, "text", FILE_COL_GRID_LABEL)
+        self.update_file_grid_layout()
+
+        grid_scrolled = Gtk.ScrolledWindow()
+        grid_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        grid_scrolled.set_hexpand(True)
+        grid_scrolled.set_vexpand(True)
+        grid_scrolled.get_style_context().add_class("card")
+        grid_scrolled.add(self.file_grid)
+
+        self.file_stack = Gtk.Stack()
+        self.file_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.file_stack.set_transition_duration(120)
+        self.file_stack.set_hexpand(True)
+        self.file_stack.set_vexpand(True)
+        self.file_stack.add_named(tree_scrolled, "list")
+        self.file_stack.add_named(grid_scrolled, "grid")
+        self.file_stack.set_visible_child_name("list")
+        page.pack_start(self.file_stack, True, True, 0)
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         page.pack_start(actions, False, False, 0)
+        self.file_actions = actions
 
         open_button = Gtk.Button(label="Mở thư mục")
         open_button.connect("clicked", self.open_selected_remote_item)
@@ -1844,21 +2154,182 @@ class AdapterStatus(Gtk.Window):
         page.pack_start(self.file_info_panel, False, False, 0)
         self.set_file_info_text(
             "Bấm Refresh để đọc thư mục /. Double-click thư mục để mở.\n"
-            "ADB phải ở trạng thái device trước khi duyệt file hoặc mở video."
+            "Khi ADB đã connect, app tự refresh khi mở tab và tự đồng bộ mỗi "
+            f"{FILE_EXPLORER_AUTO_REFRESH_SECONDS} giây. Bấm Focus để xem file rộng hơn."
         )
         self.update_file_buttons()
         self.current_remote_path = "/"
         return page
 
-    def add_file_column(self, tree, title, index, expand=False, width=None):
+    def add_file_name_column(self, tree):
+        icon_renderer = Gtk.CellRendererPixbuf()
+        text_renderer = Gtk.CellRendererText()
+        text_renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+
+        column = Gtk.TreeViewColumn("Tên")
+        column.pack_start(icon_renderer, False)
+        column.add_attribute(icon_renderer, "pixbuf", FILE_COL_LIST_ICON)
+        column.pack_start(text_renderer, True)
+        column.add_attribute(text_renderer, "text", FILE_COL_NAME)
+        column.set_resizable(True)
+        column.set_expand(True)
+        column.set_min_width(330)
+        column.set_clickable(True)
+        column.connect("clicked", self.on_file_column_clicked, "name")
+        tree.append_column(column)
+
+    def add_file_column(self, tree, title, index, expand=False, width=None, sort_id=None):
         renderer = Gtk.CellRendererText()
         renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
         column = Gtk.TreeViewColumn(title, renderer, text=index)
         column.set_resizable(True)
         column.set_expand(expand)
+        if sort_id:
+            column.set_clickable(True)
+            column.connect("clicked", self.on_file_column_clicked, sort_id)
         if width:
             column.set_min_width(width)
         tree.append_column(column)
+
+    def on_file_column_clicked(self, _column, sort_id):
+        if self.file_sort_id == sort_id:
+            self.file_sort_desc = not self.file_sort_desc
+        else:
+            self.file_sort_id = sort_id
+            self.file_sort_desc = False
+        self.refresh_file_store(preserve_selection=True)
+        return False
+
+    def load_icon_pixbuf(self, icon_name, size):
+        safe_name = icon_name or "application-octet-stream"
+        safe_size = max(16, int(size or FILE_LIST_ICON_SIZE))
+        cache_key = (safe_name, safe_size)
+        if cache_key in self.file_icon_cache:
+            return self.file_icon_cache[cache_key]
+
+        theme = Gtk.IconTheme.get_default()
+        for candidate in (safe_name, "text-x-generic", "application-octet-stream"):
+            try:
+                pixbuf = theme.load_icon(candidate, safe_size, Gtk.IconLookupFlags.FORCE_SIZE)
+                self.file_icon_cache[cache_key] = pixbuf
+                return pixbuf
+            except GLib.Error:
+                continue
+
+        self.file_icon_cache[cache_key] = None
+        return None
+
+    def sorted_remote_entries(self):
+        entries = list(getattr(self, "remote_entries", []))
+        sort_id = getattr(self, "file_sort_id", "name")
+        reverse = bool(getattr(self, "file_sort_desc", False))
+        dirs_first = bool(getattr(self, "file_dirs_first", True))
+
+        if dirs_first:
+            dirs = [item for item in entries if item.get("is_dir")]
+            rest = [item for item in entries if not item.get("is_dir")]
+            return (
+                sorted(dirs, key=lambda item: remote_entry_sort_key(item, sort_id), reverse=reverse)
+                + sorted(rest, key=lambda item: remote_entry_sort_key(item, sort_id), reverse=reverse)
+            )
+        return sorted(entries, key=lambda item: remote_entry_sort_key(item, sort_id), reverse=reverse)
+
+    def refresh_file_store(self, preserve_selection=False, selected_path=None, update_info=True):
+        if preserve_selection and not selected_path and self.selected_remote_item:
+            selected_path = self.selected_remote_item.get("path")
+
+        self.syncing_file_selection = True
+        try:
+            self.file_store.clear()
+            grid_icon_size = int(getattr(self, "file_grid_icon_size", FILE_GRID_ICON_DEFAULT_SIZE))
+            for item in self.sorted_remote_entries():
+                icon_name = remote_item_icon_name(item)
+                self.file_store.append(
+                    [
+                        self.load_icon_pixbuf(icon_name, FILE_LIST_ICON_SIZE),
+                        self.load_icon_pixbuf(icon_name, grid_icon_size),
+                        remote_item_display_name(item),
+                        remote_item_grid_label(item),
+                        remote_item_kind_label(item),
+                        item["size_text"],
+                        item["permissions"],
+                        f"{item['owner']}/{item['group']}",
+                        item["modified"],
+                        item["path"],
+                        item["is_dir"],
+                        int(item["size"]),
+                        item["group"],
+                        item["kind"],
+                        item.get("link_target", ""),
+                        icon_name,
+                    ]
+                )
+        finally:
+            self.syncing_file_selection = False
+
+        if selected_path:
+            restored_item = self.item_from_remote_path(selected_path)
+            if restored_item:
+                self.selected_remote_item = restored_item
+                if update_info:
+                    self.set_file_info_text(self.describe_remote_item(restored_item))
+                self.select_remote_path_in_views(selected_path)
+            else:
+                self.selected_remote_item = None
+                if update_info:
+                    self.set_file_info_text("Mục đã chọn không còn trong thư mục hiện tại.")
+            self.update_file_buttons()
+
+    def on_file_focus_toggled(self, toggle):
+        self.set_file_focus(toggle.get_active())
+        return False
+
+    def disable_file_focus(self, _button=None):
+        if hasattr(self, "file_focus_toggle") and self.file_focus_toggle.get_active():
+            self.file_focus_toggle.set_active(False)
+        else:
+            self.set_file_focus(False)
+        return False
+
+    def set_file_focus(self, enabled):
+        self.file_focus_mode = bool(enabled)
+        hidden_widgets = [
+            getattr(self, "file_title", None),
+            getattr(self, "file_note", None),
+            getattr(self, "file_nav", None),
+            getattr(self, "file_count_label", None),
+            getattr(self, "file_actions", None),
+            getattr(self, "file_info_panel", None),
+        ]
+
+        if self.file_focus_mode:
+            for widget in hidden_widgets:
+                if widget:
+                    widget.hide()
+            self.update_file_focus_path()
+            self.file_focus_bar.set_no_show_all(False)
+            self.file_focus_bar.show_all()
+        else:
+            self.file_focus_bar.hide()
+            self.file_focus_bar.set_no_show_all(True)
+            for widget in hidden_widgets:
+                if widget:
+                    widget.show_all()
+
+        return False
+
+    def update_file_focus_path(self):
+        if hasattr(self, "file_focus_path_label"):
+            self.file_focus_path_label.set_text(getattr(self, "current_remote_path", "/"))
+        return False
+
+    def update_file_grid_layout(self):
+        size = int(getattr(self, "file_grid_icon_size", FILE_GRID_ICON_DEFAULT_SIZE))
+        item_width = max(116, size + 74)
+        self.file_grid.set_item_width(item_width)
+        if hasattr(self, "file_grid_text_renderer"):
+            self.file_grid_text_renderer.set_property("wrap-width", max(96, item_width - 16))
+            self.file_grid_text_renderer.set_property("width", max(96, item_width - 16))
 
     def current_config(self):
         config = {
@@ -1903,30 +2374,38 @@ class AdapterStatus(Gtk.Window):
 
     def selected_item_from_row(self, row):
         return {
-            "name": row[0],
-            "kind": row[1],
-            "size_text": row[2],
-            "permissions": row[3],
-            "owner_group": row[4],
-            "modified": row[5],
-            "path": row[6],
-            "is_dir": bool(row[7]),
-            "size": int(row[8]),
-            "group": row[9],
+            "name": row[FILE_COL_NAME],
+            "kind_label": row[FILE_COL_KIND_LABEL],
+            "kind": row[FILE_COL_KIND],
+            "size_text": row[FILE_COL_SIZE_TEXT],
+            "permissions": row[FILE_COL_PERMISSIONS],
+            "owner_group": row[FILE_COL_OWNER_GROUP],
+            "modified": row[FILE_COL_MODIFIED],
+            "path": row[FILE_COL_PATH],
+            "is_dir": bool(row[FILE_COL_IS_DIR]),
+            "size": int(row[FILE_COL_SIZE]),
+            "group": row[FILE_COL_GROUP],
+            "link_target": row[FILE_COL_LINK_TARGET],
+            "icon_name": row[FILE_COL_ICON_NAME],
         }
 
     def describe_remote_item(self, item):
         if not item:
             return "Chưa chọn file/thư mục."
-        return "\n".join(
+        link_line = f"Link tới: {item['link_target']}" if item.get("link_target") else None
+        lines = [
+            f"Path: {item['path']}",
+            f"Tên: {item['name']}",
+            f"Loại: {item.get('kind_label') or item['kind']}",
+            f"Size: {item['size_text']}",
+            f"Quyền: {item['permissions']}",
+            f"Owner/Group: {item['owner_group']}",
+            f"Sửa lúc: {item['modified']}",
+        ]
+        if link_line:
+            lines.append(link_line)
+        lines.extend(
             [
-                f"Path: {item['path']}",
-                f"Tên: {item['name']}",
-                f"Loại: {item['kind']}",
-                f"Size: {item['size_text']}",
-                f"Quyền: {item['permissions']}",
-                f"Owner/Group: {item['owner_group']}",
-                f"Sửa lúc: {item['modified']}",
                 "",
                 (
                     "Đây là file ảnh: có thể bấm Xem ảnh hoặc double-click để mở."
@@ -1937,6 +2416,9 @@ class AdapterStatus(Gtk.Window):
                     else "Double-click thư mục để mở. File thường có thể Xem text hoặc Pull về máy."
                 ),
             ]
+        )
+        return "\n".join(
+            lines
         )
 
     def browse_remote_path(self, _widget=None):
@@ -1949,25 +2431,42 @@ class AdapterStatus(Gtk.Window):
     def go_remote_root(self, _button):
         self.load_remote_dir("/")
 
-    def load_remote_dir(self, path):
+    def load_remote_dir(self, path, preserve_selection=False, quiet=False):
         if self.file_running:
-            self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            if not quiet:
+                self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
             return False
 
-        self.store_current_config()
+        if quiet:
+            config = self.current_config()
+        else:
+            self.store_current_config()
+            config = dict(self.config)
         base_path = getattr(self, "current_remote_path", "/")
         normalized = normalize_remote_path(path, base_path)
+        selected_path = (
+            self.selected_remote_item.get("path")
+            if preserve_selection and self.selected_remote_item
+            else None
+        )
         self.remote_path_entry.set_text(normalized)
+        if hasattr(self, "file_focus_path_label"):
+            self.file_focus_path_label.set_text(normalized)
         self.file_running = True
-        self.selected_remote_item = None
+        if not preserve_selection:
+            self.selected_remote_item = None
         self.update_file_buttons()
-        self.file_count_label.set_text(f"Đang đọc: {normalized}")
-        self.set_file_info_text(f"Đang đọc thư mục qua ADB: {normalized}")
-
-        config = dict(self.config)
+        self.file_count_label.set_text(
+            f"Đang tự đồng bộ: {normalized}" if quiet else f"Đang đọc: {normalized}"
+        )
+        if not quiet:
+            self.set_file_info_text(f"Đang đọc thư mục qua ADB: {normalized}")
 
         def worker():
             result = list_remote_dir(config, normalized)
+            result["preserve_selection"] = bool(preserve_selection)
+            result["selected_path"] = selected_path
+            result["quiet"] = bool(quiet)
             GLib.idle_add(self.apply_remote_dir, result)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1975,64 +2474,145 @@ class AdapterStatus(Gtk.Window):
 
     def apply_remote_dir(self, result):
         self.file_running = False
-        self.file_store.clear()
-        self.selected_remote_item = None
+        quiet = bool(result.get("quiet"))
+        preserve_selection = bool(result.get("preserve_selection"))
+        selected_path = result.get("selected_path")
 
         if not result.get("ok"):
-            self.file_count_label.set_text(f"Không đọc được: {result.get('path', '/')}")
-            self.set_file_info_text(result.get("message", "Không đọc được thư mục."))
+            if quiet:
+                current_path = getattr(self, "current_remote_path", result.get("path", "/"))
+                self.file_count_label.set_text(
+                    f"{current_path}: tự đồng bộ lỗi lúc {time.strftime('%H:%M:%S')}"
+                )
+                if not getattr(self, "remote_entries", []):
+                    self.set_file_info_text(result.get("message", "Không đọc được thư mục."))
+            else:
+                self.file_store.clear()
+                self.selected_remote_item = None
+                self.remote_entries = []
+                self.file_count_label.set_text(f"Không đọc được: {result.get('path', '/')}")
+                self.set_file_info_text(result.get("message", "Không đọc được thư mục."))
             self.update_file_buttons()
             return False
 
+        if not preserve_selection:
+            self.selected_remote_item = None
         self.current_remote_path = result["path"]
         self.remote_path_entry.set_text(self.current_remote_path)
+        self.update_file_focus_path()
         entries = result.get("entries", [])
-        for item in entries:
-            self.file_store.append(
-                [
-                    item["name"],
-                    item["kind"],
-                    item["size_text"],
-                    item["permissions"],
-                    f"{item['owner']}/{item['group']}",
-                    item["modified"],
-                    item["path"],
-                    item["is_dir"],
-                    item["size"],
-                    item["group"],
-                ]
-            )
+        self.remote_entries = entries
+        self.refresh_file_store(
+            preserve_selection=preserve_selection,
+            selected_path=selected_path,
+            update_info=not quiet,
+        )
 
         self.file_count_label.set_text(
             f"{self.current_remote_path}: {len(entries)} mục - cập nhật {time.strftime('%H:%M:%S')}"
         )
-        self.set_file_info_text(
-            "Đã đọc thư mục. Chọn một dòng để xem thông tin, double-click thư mục để mở."
-            if entries
-            else "Thư mục trống hoặc không có mục đọc được."
-        )
+        if not quiet:
+            self.set_file_info_text(
+                "Đã đọc thư mục. Chọn một dòng để xem thông tin, double-click thư mục để mở."
+                if entries
+                else "Thư mục trống hoặc không có mục đọc được."
+            )
         self.update_file_buttons()
         return False
 
     def on_remote_selection_changed(self, selection):
+        if self.syncing_file_selection:
+            return False
+
         model, tree_iter = selection.get_selected()
         if tree_iter is None:
-            self.selected_remote_item = None
-            self.set_file_info_text("Chưa chọn file/thư mục.")
+            self.apply_remote_selection(None, sync_views=False)
         else:
-            self.selected_remote_item = self.selected_item_from_row(model[tree_iter])
-            self.set_file_info_text(self.describe_remote_item(self.selected_remote_item))
-        self.update_file_buttons()
+            self.apply_remote_selection(self.selected_item_from_row(model[tree_iter]), sync_views=True)
+        return False
 
     def open_remote_row(self, tree, path, _column):
         model = tree.get_model()
-        tree_iter = model.get_iter(path)
-        item = self.selected_item_from_row(model[tree_iter])
+        item = self.selected_item_from_model_path(model, path)
+        self.open_remote_item(item)
+        return False
+
+    def on_remote_grid_selection_changed(self, icon_view):
+        if self.syncing_file_selection:
+            return False
+
+        paths = icon_view.get_selected_items()
+        if not paths:
+            self.apply_remote_selection(None, sync_views=False)
+            return False
+
+        item = self.selected_item_from_model_path(icon_view.get_model(), paths[0])
+        self.apply_remote_selection(item, sync_views=True)
+        return False
+
+    def open_remote_grid_item(self, icon_view, path):
+        item = self.selected_item_from_model_path(icon_view.get_model(), path)
+        self.open_remote_item(item)
+        return False
+
+    def item_from_remote_path(self, remote_path):
+        tree_iter = self.file_store.get_iter_first()
+        while tree_iter is not None:
+            if self.file_store[tree_iter][FILE_COL_PATH] == remote_path:
+                return self.selected_item_from_row(self.file_store[tree_iter])
+            tree_iter = self.file_store.iter_next(tree_iter)
+        return None
+
+    def selected_item_from_model_path(self, model, path):
+        try:
+            tree_iter = model.get_iter(path)
+        except (TypeError, ValueError):
+            return None
+        return self.selected_item_from_row(model[tree_iter])
+
+    def apply_remote_selection(self, item, sync_views=True):
+        self.selected_remote_item = item
+        if item is None:
+            self.set_file_info_text("Chưa chọn file/thư mục.")
+        else:
+            self.set_file_info_text(self.describe_remote_item(item))
+            if sync_views:
+                self.select_remote_path_in_views(item.get("path"))
+        self.update_file_buttons()
+
+    def select_remote_path_in_views(self, remote_path):
+        if not remote_path:
+            return False
+
+        tree_iter = self.file_store.get_iter_first()
+        while tree_iter is not None:
+            if self.file_store[tree_iter][FILE_COL_PATH] == remote_path:
+                tree_path = self.file_store.get_path(tree_iter)
+                self.syncing_file_selection = True
+                try:
+                    self.file_tree.get_selection().select_path(tree_path)
+                    self.file_tree.scroll_to_cell(tree_path, None, False, 0.0, 0.0)
+                    self.file_grid.unselect_all()
+                    self.file_grid.select_path(tree_path)
+                    self.file_grid.scroll_to_path(tree_path, False, 0.0, 0.0)
+                finally:
+                    self.syncing_file_selection = False
+                return True
+            tree_iter = self.file_store.iter_next(tree_iter)
+        return False
+
+    def open_remote_item(self, item):
+        if not item:
+            return False
         if item.get("is_dir") or item.get("kind") == "Liên kết":
             self.load_remote_dir(item["path"])
         elif item.get("kind") == "File" and is_image_path(item.get("path", "")):
             self.selected_remote_item = item
             self.view_selected_remote_image(None)
+        elif item.get("kind") == "File" and is_video_path(item.get("path", "")):
+            self.selected_remote_item = item
+            self.open_selected_remote_video(None)
+        return False
 
     def open_selected_remote_item(self, _button):
         item = self.selected_remote_item
@@ -2495,6 +3075,7 @@ class AdapterStatus(Gtk.Window):
 
     def apply_status(self, status):
         self.poll_running = False
+        self.last_status = dict(status)
         self.set_banner(status["banner_text"], status["banner_state"])
         self.set_terminal_button_ready(status.get("adb_ok", False))
 
