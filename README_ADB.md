@@ -392,6 +392,7 @@ Cách dùng:
 - Bấm **Up** để quay lên thư mục cha.
 - Chọn file thường rồi bấm **Xem text** để preview tối đa 32768 bytes đầu tiên.
 - Chọn file thường rồi bấm **Pull file về máy** để tải về `~/BLTN_ADB/ecu-files`.
+- Chọn file ảnh rồi bấm **Xem ảnh**, hoặc double-click file ảnh để mở ảnh trực tiếp qua ADB.
 - Chọn file video rồi bấm **Mở video trực tiếp** để stream qua ADB bằng `mpv`. App dùng URL local có hỗ trợ seek/range, không tải toàn bộ file trước.
 - Bấm **Dừng video** để đóng stream nếu cần.
 - Bấm **Copy path** để copy đường dẫn file/thư mục đang chọn.
@@ -403,6 +404,7 @@ Giới hạn an toàn:
 - Video được mở bằng `mpv` qua HTTP local range server; backend chỉ đọc byte-range cần thiết từ ECU qua ADB.
 - Cơ chế này xử lý tốt hơn các MP4 có metadata ở cuối file so với pipe tuần tự `adb exec-out cat file | mpv -`.
 - Nếu máy chưa có `mpv`, cài bằng `sudo apt-get install -y mpv`.
+- Ảnh được đọc trực tiếp vào bộ nhớ để xem nhanh, giới hạn preview mặc định là 50 MB.
 - File binary không phải video chỉ nên pull về máy, không nên preview trực tiếp.
 
 ## 15. Quy Trình Khi Rút/Cắm Lại Cổng

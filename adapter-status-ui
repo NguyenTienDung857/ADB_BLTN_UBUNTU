@@ -17,7 +17,7 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk, Pango
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
 
 
 CONFIG_DIR = os.path.expanduser("~/.config/adapter-status")
@@ -37,6 +37,19 @@ CONNECT_WINDOW_SECONDS = 60.0
 REMOTE_PREVIEW_LIMIT = 32768
 FILE_EXPLORER_TIMEOUT = 10
 VIDEO_STREAM_CHUNK_SIZE = 262144
+IMAGE_PREVIEW_MAX_BYTES = 50 * 1024 * 1024
+IMAGE_PREVIEW_MAX_WIDTH = 1200
+IMAGE_PREVIEW_MAX_HEIGHT = 800
+IMAGE_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".gif",
+    ".webp",
+    ".tif",
+    ".tiff",
+)
 VIDEO_EXTENSIONS = (
     ".mp4",
     ".m4v",
@@ -117,6 +130,7 @@ Tab File Explorer
 - Double-click thư mục để mở, bấm Up để quay lên thư mục cha.
 - Chọn file thường rồi bấm Xem text để đọc tối đa 32768 bytes đầu tiên.
 - Chọn file thường rồi bấm Pull file về máy để tải về thư mục /home/bltn/BLTN_ADB/ecu-files.
+- Chọn file ảnh rồi bấm Xem ảnh, hoặc double-click file ảnh để mở ảnh trực tiếp qua ADB.
 - Chọn file video rồi bấm Mở video trực tiếp để stream qua ADB bằng mpv. App dùng URL local có hỗ trợ seek/range, không tải toàn bộ file trước.
 - Bấm Dừng video để đóng stream nếu cần.
 - Tab này chỉ đọc trên ECU. Không có nút xóa/sửa/push/chmod/remount để tránh làm hỏng build.
@@ -588,6 +602,46 @@ def run(command, timeout=2, purpose="command"):
             unregister_process(proc.pid)
 
 
+def run_binary(command, timeout=FILE_EXPLORER_TIMEOUT, purpose="command"):
+    is_adb_command = command_name(command) == "adb"
+    adb_servers_before = tracked_adb_server_pids() if is_adb_command else set()
+    proc = None
+    record = None
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=adb_env(),
+            start_new_session=True,
+        )
+        record = register_process(proc.pid, command, purpose)
+        output, stderr = proc.communicate(timeout=timeout)
+        if proc.returncode == 0:
+            return proc.returncode, output or b""
+        return proc.returncode, (stderr or output or b"")
+    except subprocess.TimeoutExpired:
+        if record:
+            kill_tracked_record(record)
+        elif proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            output, stderr = proc.communicate(timeout=1)
+        except Exception:
+            output, stderr = b"", b""
+        return 124, (stderr or output or b"") + b"\nCommand timeout"
+    except Exception as exc:
+        return 1, str(exc).encode("utf-8", errors="replace")
+    finally:
+        if is_adb_command:
+            register_new_adb_servers(adb_servers_before)
+        if proc:
+            unregister_process(proc.pid)
+
+
 def read_file(path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -849,6 +903,86 @@ def pull_remote_file(config, remote_path):
     if code == 0:
         output = (output + "\n" if output else "") + f"Đã lưu: {destination}"
     return code, output, destination
+
+
+def is_image_path(path):
+    lower = str(path or "").lower()
+    return any(lower.endswith(extension) for extension in IMAGE_EXTENSIONS)
+
+
+def read_remote_binary_file(config, remote_path, timeout=FILE_EXPLORER_TIMEOUT):
+    normalized = normalize_remote_path(remote_path)
+    command = [
+        "adb",
+        "-s",
+        adb_target(config),
+        "exec-out",
+        "sh",
+        "-c",
+        f"cat {quote_remote_path(normalized)}",
+    ]
+    return run_binary(command, timeout=timeout, purpose="file-binary-read")
+
+
+def read_remote_image(config, remote_path):
+    normalized = normalize_remote_path(remote_path)
+    if not is_image_path(normalized):
+        return {
+            "ok": False,
+            "path": normalized,
+            "data": b"",
+            "message": f"Không nhận diện là file ảnh: {normalized}",
+        }
+
+    state, devices_output = ensure_adb_device(config)
+    if state != "device":
+        return {
+            "ok": False,
+            "path": normalized,
+            "data": b"",
+            "message": (
+                f"ADB chưa sẵn sàng cho {adb_target(config)}. State: {state or 'not connected'}\n"
+                f"{devices_output}"
+            ).strip(),
+        }
+
+    size, size_error = remote_file_size(config, normalized)
+    if not size:
+        return {
+            "ok": False,
+            "path": normalized,
+            "data": b"",
+            "message": (
+                f"Không lấy được size hoặc file không còn tồn tại:\n{normalized}\n"
+                f"{size_error}"
+            ).strip(),
+        }
+    if size > IMAGE_PREVIEW_MAX_BYTES:
+        return {
+            "ok": False,
+            "path": normalized,
+            "data": b"",
+            "message": (
+                f"Ảnh quá lớn để preview trực tiếp: {human_size(size)}.\n"
+                "Dùng Pull file về máy nếu cần xem bằng trình xem ảnh ngoài."
+            ),
+        }
+
+    code, data = read_remote_binary_file(config, normalized, timeout=30)
+    if code != 0:
+        return {
+            "ok": False,
+            "path": normalized,
+            "data": b"",
+            "message": data.decode("utf-8", errors="replace") or f"Không đọc được ảnh: {normalized}",
+        }
+    return {
+        "ok": True,
+        "path": normalized,
+        "data": data,
+        "size": size,
+        "message": f"Đã đọc ảnh: {normalized}",
+    }
 
 
 def is_video_path(path):
@@ -1690,6 +1824,10 @@ class AdapterStatus(Gtk.Window):
         self.pull_button.connect("clicked", self.pull_selected_remote_file)
         actions.pack_start(self.pull_button, False, False, 0)
 
+        self.image_button = Gtk.Button(label="Xem ảnh")
+        self.image_button.connect("clicked", self.view_selected_remote_image)
+        actions.pack_start(self.image_button, False, False, 0)
+
         self.video_button = Gtk.Button(label="Mở video trực tiếp")
         self.video_button.connect("clicked", self.open_selected_remote_video)
         actions.pack_start(self.video_button, False, False, 0)
@@ -1745,6 +1883,7 @@ class AdapterStatus(Gtk.Window):
         has_item = item is not None
         is_directory_like = has_item and (item.get("is_dir") or item.get("kind") == "Liên kết")
         is_regular_file = has_item and item.get("kind") == "File"
+        is_image_file = is_regular_file and is_image_path(item.get("path", ""))
         is_video_file = is_regular_file and is_video_path(item.get("path", ""))
 
         if hasattr(self, "open_remote_button"):
@@ -1753,6 +1892,8 @@ class AdapterStatus(Gtk.Window):
             self.preview_button.set_sensitive(bool(is_regular_file) and not self.file_running)
         if hasattr(self, "pull_button"):
             self.pull_button.set_sensitive(bool(is_regular_file) and not self.file_running)
+        if hasattr(self, "image_button"):
+            self.image_button.set_sensitive(bool(is_image_file) and not self.file_running)
         if hasattr(self, "video_button"):
             self.video_button.set_sensitive(bool(is_video_file) and not self.file_running)
         if hasattr(self, "stop_video_button"):
@@ -1788,6 +1929,9 @@ class AdapterStatus(Gtk.Window):
                 f"Sửa lúc: {item['modified']}",
                 "",
                 (
+                    "Đây là file ảnh: có thể bấm Xem ảnh hoặc double-click để mở."
+                    if item.get("kind") == "File" and is_image_path(item["path"])
+                    else
                     "Đây là file video: có thể bấm Mở video trực tiếp."
                     if item.get("kind") == "File" and is_video_path(item["path"])
                     else "Double-click thư mục để mở. File thường có thể Xem text hoặc Pull về máy."
@@ -1886,6 +2030,9 @@ class AdapterStatus(Gtk.Window):
         item = self.selected_item_from_row(model[tree_iter])
         if item.get("is_dir") or item.get("kind") == "Liên kết":
             self.load_remote_dir(item["path"])
+        elif item.get("kind") == "File" and is_image_path(item.get("path", "")):
+            self.selected_remote_item = item
+            self.view_selected_remote_image(None)
 
     def open_selected_remote_item(self, _button):
         item = self.selected_remote_item
@@ -1950,6 +2097,117 @@ class AdapterStatus(Gtk.Window):
 
         threading.Thread(target=worker, daemon=True).start()
         return True
+
+    def view_selected_remote_image(self, _button):
+        item = self.selected_remote_item
+        if not item or item.get("kind") != "File" or not is_image_path(item.get("path", "")):
+            self.set_file_info_text("Chỉ xem trực tiếp file ảnh được nhận diện theo đuôi file.")
+            return False
+        if self.file_running:
+            self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        self.store_current_config()
+        self.file_running = True
+        self.update_file_buttons()
+        self.set_file_info_text(f"Đang đọc ảnh qua ADB:\n{item['path']}")
+        config = dict(self.config)
+        remote_path = item["path"]
+
+        def worker():
+            result = read_remote_image(config, remote_path)
+            GLib.idle_add(self.finish_remote_image_read, result)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def finish_remote_image_read(self, result):
+        self.file_running = False
+        if not result.get("ok"):
+            self.set_file_info_text(result.get("message", "Không đọc được ảnh."))
+            self.update_file_buttons()
+            return False
+
+        try:
+            pixbuf = self.pixbuf_from_image_data(result.get("data", b""))
+        except Exception as exc:
+            self.set_file_info_text(f"Không decode được ảnh:\n{result.get('path', '')}\n{exc}")
+            self.update_file_buttons()
+            return False
+
+        self.show_image_window(result["path"], pixbuf, result.get("size", len(result.get("data", b""))))
+        self.set_file_info_text(
+            f"Đã mở ảnh:\n{result['path']}\n"
+            f"Kích thước file: {human_size(result.get('size', 0))}\n"
+            f"Độ phân giải: {pixbuf.get_width()}x{pixbuf.get_height()}"
+        )
+        self.update_file_buttons()
+        return False
+
+    def pixbuf_from_image_data(self, data):
+        loader = GdkPixbuf.PixbufLoader()
+        loader.write(data)
+        loader.close()
+        pixbuf = loader.get_pixbuf()
+        if not pixbuf:
+            raise ValueError("GdkPixbuf không đọc được dữ liệu ảnh.")
+        return pixbuf
+
+    def scaled_image_pixbuf(self, pixbuf):
+        width = pixbuf.get_width()
+        height = pixbuf.get_height()
+        if width <= IMAGE_PREVIEW_MAX_WIDTH and height <= IMAGE_PREVIEW_MAX_HEIGHT:
+            return pixbuf
+
+        scale = min(IMAGE_PREVIEW_MAX_WIDTH / width, IMAGE_PREVIEW_MAX_HEIGHT / height)
+        scaled_width = max(1, int(width * scale))
+        scaled_height = max(1, int(height * scale))
+        return pixbuf.scale_simple(scaled_width, scaled_height, GdkPixbuf.InterpType.BILINEAR)
+
+    def show_image_window(self, remote_path, pixbuf, size):
+        display_pixbuf = self.scaled_image_pixbuf(pixbuf)
+        dialog = Gtk.Window(title=f"Xem ảnh - {posixpath.basename(normalize_remote_path(remote_path))}")
+        dialog.set_transient_for(self)
+        dialog.set_default_size(980, 720)
+        dialog.set_border_width(12)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        dialog.add(root)
+
+        title = Gtk.Label(label=posixpath.basename(normalize_remote_path(remote_path)))
+        title.set_xalign(0)
+        title.get_style_context().add_class("title")
+        root.pack_start(title, False, False, 0)
+
+        details = Gtk.Label(
+            label=(
+                f"Path: {normalize_remote_path(remote_path)}\n"
+                f"File: {human_size(size)} | Ảnh gốc: {pixbuf.get_width()}x{pixbuf.get_height()} | "
+                f"Hiển thị: {display_pixbuf.get_width()}x{display_pixbuf.get_height()}"
+            )
+        )
+        details.set_xalign(0)
+        details.get_style_context().add_class("subtitle")
+        constrain_label_width(details, max_width_chars=140)
+        root.pack_start(details, False, False, 0)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_hexpand(True)
+        scrolled.set_vexpand(True)
+        scrolled.get_style_context().add_class("card")
+        root.pack_start(scrolled, True, True, 0)
+
+        image = Gtk.Image.new_from_pixbuf(display_pixbuf)
+        image.set_halign(Gtk.Align.CENTER)
+        image.set_valign(Gtk.Align.CENTER)
+        scrolled.add(image)
+
+        close_button = Gtk.Button(label="Đóng")
+        close_button.connect("clicked", lambda _button: dialog.destroy())
+        root.pack_start(close_button, False, False, 0)
+
+        dialog.show_all()
 
     def open_selected_remote_video(self, _button):
         item = self.selected_remote_item
