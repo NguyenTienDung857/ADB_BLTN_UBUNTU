@@ -93,6 +93,7 @@ DATABASE_EXTENSIONS = (
 )
 FILE_LIST_ICON_SIZE = 24
 FILE_GRID_ICON_DEFAULT_SIZE = 88
+DEVICE_INFO_TTL_SECONDS = 15
 
 FILE_COL_LIST_ICON = 0
 FILE_COL_GRID_ICON = 1
@@ -116,6 +117,21 @@ DEFAULT_ADB_WORKDIR = os.path.expanduser("~/BLTN_ADB")
 IFACE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 USB_IFACE_PATTERN = re.compile(r"enx[0-9A-Fa-f]{12}")
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+DEVICE_INFO_LINE_PATTERN = re.compile(
+    r">\s*([^\[:]+)\[([^\]]+)\]:\s*HW\[([^\]]+)\],\s*"
+    r"SW Ver\[([^\]]+)\],\s*PLATFORM\[([^\]]+)\]"
+)
+DEVICE_INFO_CACHE = {
+    "target": "",
+    "timestamp": 0.0,
+    "text": "",
+}
+DEVICE_INFO_LOCK = threading.Lock()
+DEVICE_INFO_EMPTY_TEXT = (
+    "Thông số thiết bị\n"
+    "ADB chưa connect.\n"
+    "Khi ADB status là device, app sẽ tự đọc thông số."
+)
 
 HELP_TEXT = """HƯỚNG DẪN SỬ DỤNG ADAPTER STATUS
 
@@ -817,6 +833,151 @@ def ensure_adb_device(config):
     if code != 0:
         return "", output or "Không chạy được adb devices."
     return adb_state_from_devices(output, target), output
+
+
+def first_nonempty_line(text):
+    for line in str(text or "").splitlines():
+        value = line.strip().strip("\x00")
+        if value:
+            return value
+    return ""
+
+
+def parse_shell_sections(output):
+    sections = {}
+    current = ""
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip("\r")
+        if line.startswith("__") and line.endswith("__") and len(line) > 4:
+            current = line[2:-2]
+            sections.setdefault(current, [])
+            continue
+        if current:
+            sections.setdefault(current, []).append(line)
+    return {key: "\n".join(value).strip() for key, value in sections.items()}
+
+
+def parse_key_value_lines(text):
+    values = {}
+    for line in str(text or "").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"')
+    return values
+
+
+def parse_device_version_line(text):
+    match = DEVICE_INFO_LINE_PATTERN.search(str(text or ""))
+    if not match:
+        return {}
+    model, app, hw, sw_version, platform = [part.strip() for part in match.groups()]
+    return {
+        "model_app": f"{model}[{app}]" if app else model,
+        "hw": hw,
+        "sw_version": sw_version,
+        "platform": platform,
+    }
+
+
+def build_device_info_text(sections, collected_at=None):
+    os_version_text = sections.get("OS_VERSION", "")
+    os_release = parse_key_value_lines(sections.get("OS_RELEASE", ""))
+    runtime_info = parse_device_version_line(sections.get("PLATFORM_LOG", ""))
+
+    sw_file_version = first_nonempty_line(sections.get("VRS_SW", ""))
+    chip_name = first_nonempty_line(sections.get("SOC", ""))
+    soc_family = first_nonempty_line(sections.get("SOC_FAMILY", ""))
+    os_version_lines = [line.strip() for line in os_version_text.splitlines() if line.strip()]
+    os_build = os_version_lines[0] if os_version_lines else os_release.get("VERSION_ID", "")
+
+    version_values = parse_key_value_lines(os_version_text)
+    sdk = version_values.get("SDK", "")
+    rootfs = version_values.get("ROOTFS", "")
+
+    if chip_name and soc_family:
+        soc = f"Qualcomm {chip_name} / {soc_family}"
+    elif chip_name:
+        soc = f"Qualcomm {chip_name}"
+    elif soc_family:
+        soc = soc_family
+    else:
+        soc = ""
+
+    def value(text):
+        text = str(text or "").strip()
+        return text if text else "Chưa đọc được"
+
+    lines = [
+        "Thông số thiết bị",
+        f"Model/app: {value(runtime_info.get('model_app'))}",
+        f"HW: {value(runtime_info.get('hw'))}",
+        f"SW Ver: {value(runtime_info.get('sw_version') or sw_file_version)}",
+        f"PLATFORM: {value(runtime_info.get('platform'))}",
+        f"SoC: {value(soc)}",
+        f"OS build: {value(os_build)}",
+        f"SDK: {value(sdk)}",
+        f"ROOTFS: {value(rootfs)}",
+    ]
+    if collected_at:
+        lines.extend(["", f"Cập nhật: {collected_at}"])
+    return "\n".join(lines)
+
+
+def collect_device_info_text(config):
+    target = adb_target(config)
+    now = time.time()
+    with DEVICE_INFO_LOCK:
+        if (
+            DEVICE_INFO_CACHE["target"] == target
+            and DEVICE_INFO_CACHE["text"]
+            and now - DEVICE_INFO_CACHE["timestamp"] < DEVICE_INFO_TTL_SECONDS
+        ):
+            return DEVICE_INFO_CACHE["text"]
+
+    shell_command = """
+printf '__OS_VERSION__\\n'
+cat /etc/version 2>/dev/null
+printf '__OS_RELEASE__\\n'
+cat /etc/os-release 2>/dev/null
+printf '__SOC__\\n'
+cat /sys/devices/soc0/chip_name 2>/dev/null
+printf '__SOC_FAMILY__\\n'
+cat /sys/devices/soc0/family 2>/dev/null
+printf '__VRS_SW__\\n'
+cat /ydvrs/bin/ver/sw_ver.txt 2>/dev/null || cat /mnt/data/share/hu/ver/sw_ver.txt 2>/dev/null
+printf '__PLATFORM_LOG__\\n'
+for f in $(ls -t /mnt/data/logs/dvrs_* 2>/dev/null | head -n 8); do
+    line=$(grep -a 'PLATFORM' "$f" 2>/dev/null | tail -n 1)
+    if [ -n "$line" ]; then
+        echo "$line"
+        break
+    fi
+done
+"""
+    code, output = run(
+        ["adb", "-s", target, "shell", shell_command],
+        timeout=8,
+        purpose="status-device-info",
+    )
+    if code != 0:
+        text = "Thông số thiết bị\nKhông đọc được qua ADB."
+        cleaned = clean_command_output(output)
+        if cleaned:
+            text += f"\n{cleaned}"
+    else:
+        sections = parse_shell_sections(clean_command_output(output))
+        text = build_device_info_text(sections, collected_at=time.strftime("%H:%M:%S"))
+
+    with DEVICE_INFO_LOCK:
+        DEVICE_INFO_CACHE.update(
+            {
+                "target": target,
+                "timestamp": now,
+                "text": text,
+            }
+        )
+    return text
 
 
 def normalize_remote_path(path, base_path="/"):
@@ -2009,6 +2170,9 @@ def collect_status(config):
         )
         root_output = clean_command_output(root_output)
         root_ok = root_code == 0 and is_root_id_output(root_output)
+        device_info = collect_device_info_text(config)
+    else:
+        device_info = DEVICE_INFO_EMPTY_TEXT
 
     if not exists:
         banner = ("CHƯA THẤY ADAPTER", "bad")
@@ -2069,6 +2233,7 @@ def collect_status(config):
         "banner_text": banner[0],
         "banner_state": banner[1],
         "details": "\n".join(details),
+        "device_info": device_info,
         "ping_output": ping_output,
         "adb_output": adb_output,
         "adb_ok": adb_ok,
@@ -2191,8 +2356,17 @@ class AdapterStatus(Gtk.Window):
         self.banner.get_style_context().add_class("pill")
         root.pack_start(self.banner, False, False, 0)
 
+        status_log_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        status_log_row.set_hexpand(True)
+        root.pack_start(status_log_row, False, False, 0)
+
         self.details_panel, self.details_text = make_text_panel(205, monospace=True)
-        root.pack_start(self.details_panel, False, False, 0)
+        status_log_row.pack_start(self.details_panel, True, True, 0)
+
+        self.device_info_panel, self.device_info_text = make_text_panel(205, monospace=True)
+        self.device_info_panel.set_size_request(330, 205)
+        status_log_row.pack_start(self.device_info_panel, False, False, 0)
+        self.set_device_info_text(DEVICE_INFO_EMPTY_TEXT)
 
         buttons = Gtk.Grid(column_spacing=10, row_spacing=8)
         root.pack_start(buttons, False, False, 0)
@@ -2685,6 +2859,9 @@ class AdapterStatus(Gtk.Window):
 
     def set_details_text(self, text):
         set_text_view(self.details_text, text)
+
+    def set_device_info_text(self, text):
+        set_text_view(self.device_info_text, text)
 
     def set_file_info_text(self, text):
         set_text_view(self.file_info_text, text)
@@ -3507,6 +3684,7 @@ class AdapterStatus(Gtk.Window):
         self.set_get_root_button_ready(status.get("adb_ok", False), status.get("root_ok", False))
 
         self.set_details_text(status["details"])
+        self.set_device_info_text(status.get("device_info", DEVICE_INFO_EMPTY_TEXT))
         return False
 
     def set_get_root_button_ready(self, adb_ready, root_ok=False):
