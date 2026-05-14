@@ -3,8 +3,10 @@ import glob
 import http.server
 import json
 import os
+import pty
 import posixpath
 import re
+import select
 import signal
 import shlex
 import shutil
@@ -35,11 +37,15 @@ DEFAULT_CONFIG = {
 }
 CONNECT_WINDOW_SECONDS = 60.0
 ROOT_WAIT_SECONDS = 120.0
+ROOT_DROP_WAIT_SECONDS = 25.0
 ROOT_UPDATE_REMOTE_PATH = "/tmp/cpu_update.bin"
+ROOT_CHANGE_FILE_REMOTE_PATH = "/home/adb/change_file"
 ROOT_CHANGE_FILE_COMMAND = "cd /home/adb && ./change_file"
 REMOTE_PREVIEW_LIMIT = 32768
 FILE_EXPLORER_TIMEOUT = 10
 FILE_EXPLORER_AUTO_REFRESH_SECONDS = 30
+LIVE_LOG_MAX_CHARS = 400000
+LIVE_LOG_COMMAND = "journalctl -f"
 VIDEO_STREAM_CHUNK_SIZE = 262144
 IMAGE_PREVIEW_MAX_BYTES = 50 * 1024 * 1024
 IMAGE_PREVIEW_MAX_WIDTH = 1200
@@ -128,9 +134,7 @@ DEVICE_INFO_CACHE = {
 }
 DEVICE_INFO_LOCK = threading.Lock()
 DEVICE_INFO_EMPTY_TEXT = (
-    "Thông số thiết bị\n"
-    "ADB chưa connect.\n"
-    "Khi ADB status là device, app sẽ tự đọc thông số."
+    "Model: --   |   HW: --   |   SW Ver: --   |   PLATFORM: --"
 )
 
 HELP_TEXT = """HƯỚNG DẪN SỬ DỤNG ADAPTER STATUS
@@ -184,7 +188,8 @@ Các nút thao tác
 - ADB Connect: gán lại IP, dọn ADB cũ/treo, rồi canh bắt ADB trong 60 giây.
 - Mở Terminal: chỉ sáng khi ADB đã connect; mở terminal tại thư mục app và chạy ./adb.sh.
 - Get Root: khi ADB đã connect nhưng chưa root, nút màu đỏ; chọn file DEBUG...bin rồi app tự push, chạy update cpu, chạy change_file và chờ thiết bị tự reboot.
-- Root OK: khi adb shell id trả uid=0(root), nút đổi màu xanh để báo thiết bị đã có quyền root.
+- Root OK: khi adb shell id trả uid=0(root), nút Get Root đổi màu xanh để báo thiết bị đã có quyền root.
+- Thoát Root: khi đã root, app chạy adb unroot và kiểm tra adb shell id về uid=2000(adb) để test Get Root lại.
 - Help: mở hướng dẫn này.
 
 Tab File Explorer
@@ -202,6 +207,12 @@ Tab File Explorer
 - Chọn file video rồi bấm Mở video trực tiếp để stream qua ADB bằng mpv. App dùng URL local có hỗ trợ seek/range, không tải toàn bộ file trước.
 - Bấm Dừng video để đóng stream nếu cần.
 - Tab này chỉ đọc trên ECU. Không có nút xóa/sửa/push/chmod/remount để tránh làm hỏng build.
+
+Tab Log realtime
+- Tab này nằm cạnh File Explorer và đọc log hệ thống realtime bằng journalctl -f.
+- Nút Start chỉ bật khi ADB status là device và Root status là OK - uid=0(root).
+- Tab này in đúng output của journalctl -f: vài dòng gần nhất rồi tiếp tục theo dõi realtime.
+- Bấm Stop để dừng stream trước khi disconnect hoặc Thoát Root.
 
 Khi nào cần sửa thông số
 Nếu sau khi rút/cắm lại mà tên cổng thay đổi, sửa ô Tên cổng rồi bấm Cấu hình IP hoặc ADB Connect để lưu và dùng cấu hình mới.
@@ -282,12 +293,12 @@ def constrain_label_width(label, max_width_chars=92):
     return label
 
 
-def make_text_panel(height, monospace=True):
+def make_text_panel(height, monospace=True, vexpand=False):
     scrolled = Gtk.ScrolledWindow()
     scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
     scrolled.set_size_request(-1, height)
     scrolled.set_hexpand(True)
-    scrolled.set_vexpand(False)
+    scrolled.set_vexpand(vexpand)
     scrolled.get_style_context().add_class("card")
 
     text_view = Gtk.TextView()
@@ -304,8 +315,12 @@ def make_text_panel(height, monospace=True):
 
 
 def set_text_view(text_view, text):
+    text = text or ""
     buffer = text_view.get_buffer()
-    buffer.set_text(text or "")
+    start_iter, end_iter = buffer.get_bounds()
+    if buffer.get_text(start_iter, end_iter, True) == text:
+        return
+    buffer.set_text(text)
     end_iter = buffer.get_end_iter()
     mark = buffer.create_mark(None, end_iter, False)
     text_view.scroll_mark_onscreen(mark)
@@ -730,6 +745,138 @@ def run_with_input(command, input_text, timeout=10, purpose="command"):
             unregister_process(proc.pid)
 
 
+def run_with_delayed_pty_input(
+    command,
+    input_text,
+    prompt_text,
+    completion_texts,
+    timeout=30,
+    purpose="command",
+):
+    is_adb_command = command_name(command) == "adb"
+    adb_servers_before = tracked_adb_server_pids() if is_adb_command else set()
+    master_fd = None
+    slave_fd = None
+    proc = None
+    record = None
+    sent_input = False
+    saw_completion = False
+    timed_out = False
+    chunks = []
+    completion_markers = tuple(str(item).lower() for item in completion_texts or ())
+    deadline = time.monotonic() + timeout
+
+    try:
+        master_fd, slave_fd = pty.openpty()
+        proc = subprocess.Popen(
+            command,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=adb_env(),
+            start_new_session=True,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+        slave_fd = None
+        os.set_blocking(master_fd, False)
+        record = register_process(proc.pid, command, purpose)
+
+        while time.monotonic() < deadline:
+            wait_time = min(0.25, max(0.01, deadline - time.monotonic()))
+            readable, _writable, _error = select.select([master_fd], [], [], wait_time)
+            if readable:
+                while True:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        data = b""
+                    if not data:
+                        break
+                    chunks.append(data.decode("utf-8", errors="replace"))
+
+            raw_output = "".join(chunks)
+            cleaned_output = clean_command_output(raw_output)
+            cleaned_lower = cleaned_output.lower()
+
+            if not sent_input and (not prompt_text or prompt_text in raw_output or prompt_text in cleaned_output):
+                os.write(master_fd, input_text.encode("utf-8", errors="replace"))
+                sent_input = True
+            elif sent_input and completion_markers and any(
+                marker in cleaned_lower for marker in completion_markers
+            ):
+                saw_completion = True
+                try:
+                    os.write(master_fd, b"\x03")
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                break
+
+            if proc.poll() is not None:
+                break
+        else:
+            timed_out = True
+
+        drain_deadline = time.monotonic() + 1.0
+        while time.monotonic() < drain_deadline:
+            readable, _writable, _error = select.select([master_fd], [], [], 0.05)
+            if not readable:
+                if proc.poll() is not None:
+                    break
+                continue
+            try:
+                data = os.read(master_fd, 4096)
+            except (BlockingIOError, OSError):
+                break
+            if not data:
+                break
+            chunks.append(data.decode("utf-8", errors="replace"))
+
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+        output = clean_command_output("".join(chunks))
+        if timed_out and not saw_completion:
+            if output:
+                output += "\n"
+            output += f"Command timeout: {command_text(command)}"
+            return 124, output
+        return_code = proc.returncode if proc.returncode is not None else 0
+        if saw_completion and return_code < 0:
+            return_code = 0
+        return return_code, output
+    except Exception as exc:
+        return 1, str(exc)
+    finally:
+        if slave_fd is not None:
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+        if is_adb_command:
+            register_new_adb_servers(adb_servers_before)
+        if proc:
+            unregister_process(proc.pid)
+
+
 def run_binary(command, timeout=FILE_EXPLORER_TIMEOUT, purpose="command"):
     is_adb_command = command_name(command) == "adb"
     adb_servers_before = tracked_adb_server_pids() if is_adb_command else set()
@@ -857,16 +1004,6 @@ def parse_shell_sections(output):
     return {key: "\n".join(value).strip() for key, value in sections.items()}
 
 
-def parse_key_value_lines(text):
-    values = {}
-    for line in str(text or "").splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"')
-    return values
-
-
 def parse_device_version_line(text):
     match = DEVICE_INFO_LINE_PATTERN.search(str(text or ""))
     if not match:
@@ -880,48 +1017,21 @@ def parse_device_version_line(text):
     }
 
 
-def build_device_info_text(sections, collected_at=None):
-    os_version_text = sections.get("OS_VERSION", "")
-    os_release = parse_key_value_lines(sections.get("OS_RELEASE", ""))
+def build_device_info_text(sections):
     runtime_info = parse_device_version_line(sections.get("PLATFORM_LOG", ""))
 
     sw_file_version = first_nonempty_line(sections.get("VRS_SW", ""))
-    chip_name = first_nonempty_line(sections.get("SOC", ""))
-    soc_family = first_nonempty_line(sections.get("SOC_FAMILY", ""))
-    os_version_lines = [line.strip() for line in os_version_text.splitlines() if line.strip()]
-    os_build = os_version_lines[0] if os_version_lines else os_release.get("VERSION_ID", "")
-
-    version_values = parse_key_value_lines(os_version_text)
-    sdk = version_values.get("SDK", "")
-    rootfs = version_values.get("ROOTFS", "")
-
-    if chip_name and soc_family:
-        soc = f"Qualcomm {chip_name} / {soc_family}"
-    elif chip_name:
-        soc = f"Qualcomm {chip_name}"
-    elif soc_family:
-        soc = soc_family
-    else:
-        soc = ""
 
     def value(text):
         text = str(text or "").strip()
-        return text if text else "Chưa đọc được"
+        return text if text else "--"
 
-    lines = [
-        "Thông số thiết bị",
-        f"Model/app: {value(runtime_info.get('model_app'))}",
-        f"HW: {value(runtime_info.get('hw'))}",
-        f"SW Ver: {value(runtime_info.get('sw_version') or sw_file_version)}",
-        f"PLATFORM: {value(runtime_info.get('platform'))}",
-        f"SoC: {value(soc)}",
-        f"OS build: {value(os_build)}",
-        f"SDK: {value(sdk)}",
-        f"ROOTFS: {value(rootfs)}",
-    ]
-    if collected_at:
-        lines.extend(["", f"Cập nhật: {collected_at}"])
-    return "\n".join(lines)
+    return (
+        f"Model: {value(runtime_info.get('model_app'))}   |   "
+        f"HW: {value(runtime_info.get('hw'))}   |   "
+        f"SW Ver: {value(runtime_info.get('sw_version') or sw_file_version)}   |   "
+        f"PLATFORM: {value(runtime_info.get('platform'))}"
+    )
 
 
 def collect_device_info_text(config):
@@ -936,14 +1046,6 @@ def collect_device_info_text(config):
             return DEVICE_INFO_CACHE["text"]
 
     shell_command = """
-printf '__OS_VERSION__\\n'
-cat /etc/version 2>/dev/null
-printf '__OS_RELEASE__\\n'
-cat /etc/os-release 2>/dev/null
-printf '__SOC__\\n'
-cat /sys/devices/soc0/chip_name 2>/dev/null
-printf '__SOC_FAMILY__\\n'
-cat /sys/devices/soc0/family 2>/dev/null
 printf '__VRS_SW__\\n'
 cat /ydvrs/bin/ver/sw_ver.txt 2>/dev/null || cat /mnt/data/share/hu/ver/sw_ver.txt 2>/dev/null
 printf '__PLATFORM_LOG__\\n'
@@ -961,13 +1063,10 @@ done
         purpose="status-device-info",
     )
     if code != 0:
-        text = "Thông số thiết bị\nKhông đọc được qua ADB."
-        cleaned = clean_command_output(output)
-        if cleaned:
-            text += f"\n{cleaned}"
+        text = DEVICE_INFO_EMPTY_TEXT
     else:
         sections = parse_shell_sections(clean_command_output(output))
-        text = build_device_info_text(sections, collected_at=time.strftime("%H:%M:%S"))
+        text = build_device_info_text(sections)
 
     with DEVICE_INFO_LOCK:
         DEVICE_INFO_CACHE.update(
@@ -1112,6 +1211,31 @@ def adb_shell(config, shell_command, timeout=FILE_EXPLORER_TIMEOUT, purpose="fil
         timeout=timeout,
         purpose=purpose,
     )
+
+
+def live_log_shell_command(_filter_text=""):
+    return LIVE_LOG_COMMAND
+
+
+def ensure_adb_root_device(config, purpose="root-check"):
+    target = adb_target(config)
+    state, devices_output = ensure_adb_device(config)
+    if state != "device":
+        return (
+            False,
+            (
+                f"ADB chưa sẵn sàng cho {target}. State: {state or 'not connected'}\n"
+                f"{devices_output}"
+            ).strip(),
+        )
+
+    code, output = run(["adb", "-s", target, "shell", "id"], timeout=3, purpose=purpose)
+    output = clean_command_output(output)
+    if code != 0:
+        return False, f"Không kiểm tra được root bằng adb shell id.\n{output}".strip()
+    if not is_root_id_output(output):
+        return False, f"ADB đã connect nhưng chưa có root.\nid output: {output}".strip()
+    return True, output or "uid=0(root)"
 
 
 def list_remote_dir(config, path):
@@ -1721,6 +1845,21 @@ def validate_debug_bin_path(path):
     return None
 
 
+def is_transient_adb_disconnect_output(output):
+    output_lower = str(output or "").lower()
+    markers = (
+        "error: closed",
+        "device offline",
+        "offline",
+        "device not found",
+        "no devices/emulators found",
+        "cannot connect to daemon",
+        "protocol fault",
+        "connection reset",
+    )
+    return any(marker in output_lower for marker in markers)
+
+
 def wait_for_adb_device(config, wait_seconds=10.0, log=None, purpose="adb-wait"):
     target = adb_target(config)
     deadline = time.monotonic() + wait_seconds
@@ -1766,10 +1905,12 @@ def run_cmdtool_update_cpu(config, log=None):
                     f"{devices}"
                 ).strip()
 
-        code, output = run_with_input(
+        code, output = run_with_delayed_pty_input(
             ["adb", "-s", target, "shell", "cmdtool"],
             "update cpu\n",
-            timeout=20,
+            prompt_text="VRS>",
+            completion_texts=("command status",),
+            timeout=35,
             purpose="get-root-cmdtool",
         )
         output = clean_command_output(output)
@@ -1788,6 +1929,158 @@ def run_cmdtool_update_cpu(config, log=None):
             break
 
     return False, last_code, last_output
+
+
+def remote_change_file_exists(config):
+    code, output = adb_shell(
+        config,
+        f"test -e {shlex.quote(ROOT_CHANGE_FILE_REMOTE_PATH)}; echo change_file_exists=$?",
+        timeout=5,
+        purpose="get-root-change-file-exists",
+    )
+    return code == 0 and "change_file_exists=0" in clean_command_output(output)
+
+
+def run_root_change_file(config, log=None):
+    last_code = 1
+    last_output = ""
+
+    def emit(message):
+        if log:
+            log(message)
+
+    for attempt in range(1, 3):
+        if attempt > 1:
+            emit("ADB vừa đóng khi chạy change_file; reconnect rồi chạy lại change_file.")
+
+        state, devices_output = wait_for_adb_device(
+            config,
+            wait_seconds=12.0,
+            log=emit,
+            purpose=f"get-root-change-file-wait-{attempt}",
+        )
+        if devices_output:
+            emit(devices_output)
+        if state != "device":
+            last_code = 1
+            last_output = f"ADB chưa sẵn sàng để chạy change_file. State: {state or 'not connected'}"
+            continue
+
+        code, output = adb_shell(
+            config,
+            ROOT_CHANGE_FILE_COMMAND,
+            timeout=30,
+            purpose="get-root-change-file",
+        )
+        output = clean_command_output(output)
+        if output:
+            emit(output)
+
+        last_code = code
+        last_output = output
+        output_lower = output.lower()
+        change_ok = (
+            "rebooting" in output_lower
+            or "setuid/setgid" in output_lower
+            or "change_file" in output_lower and "삭제" in output_lower
+        )
+        if code == 0 or change_ok:
+            return True, code, output
+
+        if not is_transient_adb_disconnect_output(output):
+            break
+
+        emit("ADB đóng phiên trong lúc chạy change_file; kiểm tra lại root trước khi kết luận lỗi.")
+        ok, message = wait_for_root_after_reboot(config, log=emit)
+        last_output = "\n".join(line for line in (output, message) if line)
+        if ok and (attempt >= 2 or not remote_change_file_exists(config)):
+            return True, code, last_output
+        if ok:
+            emit("ADB đã root nhưng change_file vẫn còn; thử chạy change_file thêm một lần để hoàn tất.")
+
+    return False, last_code, last_output
+
+
+def drop_adb_root(config, log=None):
+    target = adb_target(config)
+
+    def emit(message):
+        if log:
+            log(message)
+
+    emit("Bắt đầu Thoát Root tạm thời bằng adb unroot.")
+    state, devices_output = wait_for_adb_device(
+        config,
+        wait_seconds=10.0,
+        log=emit,
+        purpose="drop-root-precheck",
+    )
+    if devices_output:
+        emit(devices_output)
+    if state != "device":
+        return f"ADB chưa sẵn sàng để Thoát Root. State: {state or 'not connected'}"
+
+    code, id_output = run(["adb", "-s", target, "shell", "id"], timeout=5, purpose="drop-root-id-before")
+    id_output = clean_command_output(id_output)
+    if id_output:
+        emit(f"id trước khi thoát root: {id_output}")
+    if code == 0 and not is_root_id_output(id_output):
+        return f"Thiết bị đang chưa root.\n{id_output}"
+
+    code, output = run(["adb", "-s", target, "unroot"], timeout=10, purpose="drop-root-unroot")
+    output = clean_command_output(output)
+    if output:
+        emit(output)
+    output_lower = output.lower()
+    accepted_unroot = (
+        "restarting adbd as non root" in output_lower
+        or "adbd not running as root" in output_lower
+    )
+    if code != 0 and not accepted_unroot:
+        return f"adb unroot lỗi ({code}).\n{output}"
+
+    deadline = time.monotonic() + ROOT_DROP_WAIT_SECONDS
+    next_connect_at = 0.0
+    last_state = ""
+    last_id_output = ""
+    last_devices = ""
+
+    emit(f"Chờ ADB lên lại tối đa {int(ROOT_DROP_WAIT_SECONDS)} giây...")
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if now >= next_connect_at:
+            run(["adb", "connect", target], timeout=4, purpose="drop-root-connect")
+            next_connect_at = now + 2.0
+
+        code, devices = run(["adb", "devices"], timeout=2, purpose="drop-root-state")
+        last_devices = clean_command_output(devices)
+        state = adb_state_from_devices(devices, target) if code == 0 else ""
+        if state != last_state:
+            emit(f"ADB state: {state or 'chưa thấy thiết bị'}")
+            last_state = state
+
+        if state == "device":
+            code, id_output = run(
+                ["adb", "-s", target, "shell", "id"],
+                timeout=5,
+                purpose="drop-root-id-after",
+            )
+            last_id_output = clean_command_output(id_output)
+            if last_id_output:
+                emit(f"id: {last_id_output}")
+            if code == 0 and not is_root_id_output(last_id_output):
+                return f"Thoát Root OK: ADB đã về user thường.\n{last_id_output}"
+
+        time.sleep(1.0)
+
+    message = "Thoát Root chưa thành công trong thời gian chờ."
+    if last_state:
+        message += f"\nADB state cuối: {last_state}"
+    if last_id_output:
+        message += f"\nid cuối: {last_id_output}"
+    if last_devices:
+        message += f"\nadb devices cuối:\n{last_devices}"
+    return message
 
 
 def wait_for_root_after_reboot(config, log=None):
@@ -1914,17 +2207,8 @@ def get_root_with_debug_file(config, debug_path, log=None):
         return f"cmdtool update cpu chưa báo thành công ({code}).\n{output}"
 
     emit("Chạy /home/adb/change_file để đổi quyền root và reboot.")
-    code, output = adb_shell(
-        config,
-        ROOT_CHANGE_FILE_COMMAND,
-        timeout=30,
-        purpose="get-root-change-file",
-    )
-    output = clean_command_output(output)
-    if output:
-        emit(output)
-    change_ok = "rebooting" in output.lower() or "setuid/setgid" in output.lower()
-    if code != 0 and not change_ok:
+    change_ok, code, output = run_root_change_file(config, log=emit)
+    if not change_ok:
         return f"change_file lỗi ({code}).\n{output}"
 
     emit("Nếu change_file báo Rebooting, không cần reset tay; app đang chờ thiết bị tự lên lại.")
@@ -2220,7 +2504,7 @@ def collect_status(config):
             + (
                 "Bấm ADB Connect để app tự gán IP và canh ADB."
                 if not adb_ok
-                else "Đã có root, có thể bấm Mở Terminal hoặc dùng File Explorer."
+                else "Đã có root; có thể bấm Thoát Root để test Get Root lại."
                 if root_ok
                 else "Bấm Get Root để chọn file debug và lấy quyền root."
             )
@@ -2260,12 +2544,17 @@ class AdapterStatus(Gtk.Window):
         self.set_border_width(18)
         self.config = load_config()
         save_config(self.config)
-        cleaned_processes = cleanup_previous_processes(purpose_prefixes=("terminal",))
+        cleaned_processes = cleanup_previous_processes(purpose_prefixes=("terminal", "live-log"))
         self.poll_running = False
         self.action_running = False
         self.file_running = False
         self.video_running = False
         self.video_session_id = 0
+        self.live_log_running = False
+        self.live_log_starting = False
+        self.live_log_proc = None
+        self.live_log_session_id = 0
+        self.live_log_manual_stopped = False
         self.selected_remote_item = None
         self.remote_entries = []
         self.file_icon_cache = {}
@@ -2279,11 +2568,13 @@ class AdapterStatus(Gtk.Window):
         self.video_server = None
         self.last_status = {}
         self.connect("destroy", self.cleanup_video_on_destroy)
+        self.connect("destroy", self.cleanup_live_log_on_destroy)
         self.last_action = (
-            f"Đã dọn {len(cleaned_processes)} terminal cũ do app mở từ lần trước."
+            f"Đã dọn {len(cleaned_processes)} terminal/log cũ do app mở từ lần trước."
             if cleaned_processes
             else "Sẵn sàng. App không tự reset ADB/IP khi mở."
         )
+        self.status_details = ""
 
         css = Gtk.CssProvider()
         css.load_from_data(
@@ -2292,6 +2583,7 @@ class AdapterStatus(Gtk.Window):
             entry { padding: 8px; border-radius: 8px; }
             .title { font-size: 24px; font-weight: 700; color: #f9fafb; }
             .subtitle { color: #9ca3af; }
+            .device-info-line { color: #d1d5db; font-weight: 700; padding: 2px 0; }
             .label { color: #cbd5e1; font-weight: 700; }
             .pill { border-radius: 16px; padding: 14px 16px; font-size: 18px; font-weight: 800; }
             .ok { background: #065f46; color: #d1fae5; }
@@ -2313,6 +2605,8 @@ class AdapterStatus(Gtk.Window):
             button.root-needed { background-image: none; background-color: #b91c1c; color: #fef2f2; font-weight: 700; }
             button.root-ok { background-image: none; background-color: #059669; color: #ecfdf5; font-weight: 700; }
             button.root-wait { color: #6b7280; }
+            button.unroot-ready { background-image: none; background-color: #d97706; color: #fff7ed; font-weight: 700; }
+            button.unroot-wait { color: #6b7280; }
             """
         )
         Gtk.StyleContext.add_provider_for_screen(
@@ -2356,18 +2650,6 @@ class AdapterStatus(Gtk.Window):
         self.banner.get_style_context().add_class("pill")
         root.pack_start(self.banner, False, False, 0)
 
-        status_log_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        status_log_row.set_hexpand(True)
-        root.pack_start(status_log_row, False, False, 0)
-
-        self.details_panel, self.details_text = make_text_panel(205, monospace=True)
-        status_log_row.pack_start(self.details_panel, True, True, 0)
-
-        self.device_info_panel, self.device_info_text = make_text_panel(205, monospace=True)
-        self.device_info_panel.set_size_request(330, 205)
-        status_log_row.pack_start(self.device_info_panel, False, False, 0)
-        self.set_device_info_text(DEVICE_INFO_EMPTY_TEXT)
-
         buttons = Gtk.Grid(column_spacing=10, row_spacing=8)
         root.pack_start(buttons, False, False, 0)
 
@@ -2386,28 +2668,48 @@ class AdapterStatus(Gtk.Window):
         self.get_root_button.connect("clicked", self.choose_debug_file_for_root)
         buttons.attach(self.get_root_button, 2, 0, 1, 1)
 
+        self.drop_root_button = Gtk.Button(label="Thoát Root")
+        self.drop_root_button.set_sensitive(False)
+        self.drop_root_button.get_style_context().add_class("unroot-wait")
+        self.drop_root_button.set_tooltip_text("Chỉ bật khi thiết bị đang root.")
+        self.drop_root_button.connect("clicked", self.drop_root)
+        buttons.attach(self.drop_root_button, 3, 0, 1, 1)
+
         self.open_terminal_button = Gtk.Button(label="Mở Terminal")
         self.open_terminal_button.set_sensitive(False)
         self.open_terminal_button.get_style_context().add_class("terminal-wait")
         self.open_terminal_button.set_tooltip_text("ADB chưa connect.")
         self.open_terminal_button.connect("clicked", self.open_terminal)
-        buttons.attach(self.open_terminal_button, 3, 0, 1, 1)
+        buttons.attach(self.open_terminal_button, 4, 0, 1, 1)
 
         help_button = Gtk.Button(label="Help")
         help_button.connect("clicked", self.show_help)
-        buttons.attach(help_button, 4, 0, 1, 1)
+        buttons.attach(help_button, 5, 0, 1, 1)
 
         for child in buttons.get_children():
             child.set_hexpand(True)
 
-        self.action_panel, self.action_text = make_text_panel(100, monospace=True)
-        root.pack_start(self.action_panel, False, False, 0)
+        self.device_info_label = Gtk.Label(label=DEVICE_INFO_EMPTY_TEXT)
+        self.device_info_label.set_xalign(0)
+        self.device_info_label.set_hexpand(True)
+        self.device_info_label.set_single_line_mode(True)
+        self.device_info_label.set_max_width_chars(150)
+        self.device_info_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.device_info_label.get_style_context().add_class("device-info-line")
+        root.pack_start(self.device_info_label, False, False, 0)
+
+        self.action_panel, self.action_text = make_text_panel(260, monospace=True, vexpand=True)
+        root.pack_start(self.action_panel, True, True, 0)
         if self.last_action:
             self.set_action_text(self.last_action)
 
         self.file_explorer_page = self.build_file_explorer_page()
         self.file_explorer_page_num = self.notebook.append_page(
             self.file_explorer_page, Gtk.Label(label="File Explorer")
+        )
+        self.live_log_page = self.build_live_log_page()
+        self.live_log_page_num = self.notebook.append_page(
+            self.live_log_page, Gtk.Label(label="Log realtime")
         )
 
         GLib.timeout_add_seconds(1, self.refresh_async)
@@ -2430,6 +2732,8 @@ class AdapterStatus(Gtk.Window):
     def on_notebook_switch_page(self, _notebook, _page, page_num):
         if page_num == getattr(self, "file_explorer_page_num", -1):
             GLib.idle_add(self.auto_refresh_file_explorer)
+        elif page_num == getattr(self, "live_log_page_num", -1):
+            GLib.idle_add(self.update_live_log_idle_status, None, True)
         return False
 
     def adb_ready_for_file_refresh(self):
@@ -2675,6 +2979,48 @@ class AdapterStatus(Gtk.Window):
         self.current_remote_path = "/"
         return page
 
+    def build_live_log_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(4)
+
+        title = Gtk.Label(label="Log hệ thống realtime")
+        title.set_xalign(0)
+        title.get_style_context().add_class("title")
+        page.pack_start(title, False, False, 0)
+
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        page.pack_start(toolbar, False, False, 0)
+
+        self.live_log_start_button = Gtk.Button(label="Start")
+        self.live_log_start_button.set_tooltip_text("Bắt đầu theo dõi log hệ thống realtime.")
+        self.live_log_start_button.connect("clicked", self.start_live_log)
+        toolbar.pack_start(self.live_log_start_button, False, False, 0)
+
+        self.live_log_stop_button = Gtk.Button(label="Stop")
+        self.live_log_stop_button.set_tooltip_text("Dừng stream log realtime.")
+        self.live_log_stop_button.connect("clicked", self.stop_live_log)
+        toolbar.pack_start(self.live_log_stop_button, False, False, 0)
+
+        clear_button = Gtk.Button(label="Clear")
+        clear_button.connect("clicked", self.clear_live_log)
+        toolbar.pack_start(clear_button, False, False, 0)
+
+        self.live_log_status_label = Gtk.Label(label="Chờ CONNECTED - ADB ROOT READY.")
+        self.live_log_status_label.set_xalign(0)
+        self.live_log_status_label.set_hexpand(True)
+        self.live_log_status_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.live_log_status_label.get_style_context().add_class("subtitle")
+        toolbar.pack_start(self.live_log_status_label, True, True, 0)
+
+        self.live_log_panel, self.live_log_text = make_text_panel(500, monospace=True, vexpand=True)
+        page.pack_start(self.live_log_panel, True, True, 0)
+        set_text_view(
+            self.live_log_text,
+            f"Chưa chạy log. Bấm Start để chạy {LIVE_LOG_COMMAND}.",
+        )
+        self.update_live_log_controls()
+        return page
+
     def add_file_name_column(self, tree):
         icon_renderer = Gtk.CellRendererPixbuf()
         text_renderer = Gtk.CellRendererText()
@@ -2855,16 +3201,280 @@ class AdapterStatus(Gtk.Window):
         return config
 
     def set_action_text(self, text):
-        set_text_view(self.action_text, text)
+        self.last_action = text or ""
+        self.render_main_log()
 
     def set_details_text(self, text):
-        set_text_view(self.details_text, text)
+        self.status_details = text or ""
+        self.render_main_log()
 
-    def set_device_info_text(self, text):
-        set_text_view(self.device_info_text, text)
+    def render_main_log(self):
+        if not hasattr(self, "action_text"):
+            return
+        sections = []
+        status_details = str(getattr(self, "status_details", "") or "").strip()
+        last_action = str(getattr(self, "last_action", "") or "").strip()
+        if status_details:
+            sections.append(status_details)
+        if last_action:
+            sections.append(last_action)
+        set_text_view(self.action_text, "\n\n".join(sections))
+
+    def set_device_info_line(self, text):
+        text = text or DEVICE_INFO_EMPTY_TEXT
+        self.device_info_label.set_text(text)
+        self.device_info_label.set_tooltip_text(text)
 
     def set_file_info_text(self, text):
         set_text_view(self.file_info_text, text)
+
+    def set_live_log_status(self, text):
+        if hasattr(self, "live_log_status_label"):
+            self.live_log_status_label.set_text(text or "")
+
+    def live_log_root_ready(self, status=None):
+        status = status if status is not None else getattr(self, "last_status", {})
+        return bool(status.get("adb_ok") and status.get("root_ok"))
+
+    def selected_live_log_filter(self):
+        return ""
+
+    def update_live_log_controls(self, status=None):
+        if not hasattr(self, "live_log_start_button"):
+            return
+
+        root_ready = self.live_log_root_ready(status)
+        self.live_log_start_button.set_label("Start")
+        self.live_log_start_button.set_sensitive(
+            root_ready
+            and not self.live_log_starting
+            and not self.live_log_running
+            and not self.action_running
+        )
+        self.live_log_stop_button.set_sensitive(self.live_log_running or self.live_log_starting)
+
+    def clear_live_log(self, _button=None):
+        if hasattr(self, "live_log_text"):
+            set_text_view(self.live_log_text, "")
+        return False
+
+    def update_live_log_idle_status(self, status=None, force=False):
+        if self.live_log_running or self.live_log_starting:
+            return False
+
+        current_text = ""
+        if hasattr(self, "live_log_status_label"):
+            current_text = self.live_log_status_label.get_text() or ""
+
+        may_replace = force or not current_text or current_text.startswith(("Chờ", "Sẵn sàng"))
+        if not may_replace and self.live_log_root_ready(status):
+            return False
+
+        if self.live_log_root_ready(status):
+            self.set_live_log_status("Sẵn sàng. Bấm Start để theo dõi log hệ thống realtime.")
+        else:
+            self.set_live_log_status("Chờ CONNECTED - ADB ROOT READY để đọc log hệ thống realtime.")
+        return False
+
+    def start_live_log(self, _button=None, auto=False):
+        if not hasattr(self, "live_log_text"):
+            return False
+
+        self.live_log_manual_stopped = False
+        if self.action_running:
+            self.set_live_log_status("Đang có thao tác ADB khác, chưa mở Log realtime.")
+            self.update_live_log_controls()
+            return False
+        if self.live_log_starting:
+            return False
+        if self.live_log_running:
+            self.set_live_log_status("Log realtime đang chạy. Bấm Stop trước nếu muốn chạy lại.")
+            self.update_live_log_controls()
+            return False
+
+        if not self.live_log_root_ready():
+            self.set_live_log_status("ADB phải ở trạng thái device và uid=0(root) trước khi show log.")
+            self.update_live_log_controls()
+            return False
+
+        self.store_current_config()
+        config = dict(self.config)
+        filter_text = self.selected_live_log_filter()
+        self.live_log_session_id += 1
+        session_id = self.live_log_session_id
+        self.live_log_starting = True
+        self.set_live_log_status("Đang kiểm tra root và chạy journalctl -f...")
+        set_text_view(
+            self.live_log_text,
+            (
+                f"[{time.strftime('%H:%M:%S')}] Start log hệ thống realtime\n"
+                f"Lệnh: {LIVE_LOG_COMMAND}\n"
+                "journalctl -f có thể in vài dòng gần nhất rồi tiếp tục theo dõi realtime.\n"
+            ),
+        )
+        self.update_live_log_controls()
+
+        def worker():
+            self.live_log_worker(config, filter_text, session_id)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return False if auto else True
+
+    def live_log_worker(self, config, filter_text, session_id):
+        ok, message = ensure_adb_root_device(config, purpose="live-log-root-check")
+        if not ok:
+            GLib.idle_add(self.finish_live_log_start_failed, session_id, message)
+            return
+
+        target = adb_target(config)
+        shell_command = live_log_shell_command(filter_text)
+        command = ["adb", "-s", target, "shell", shell_command]
+        proc = None
+        error = ""
+        return_code = 0
+        adb_servers_before = tracked_adb_server_pids()
+
+        try:
+            proc = subprocess.Popen(
+                command,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=adb_env(),
+                start_new_session=True,
+            )
+            register_process(proc.pid, command, "live-log")
+            register_new_adb_servers(adb_servers_before)
+            self.live_log_proc = proc
+
+            if session_id != self.live_log_session_id:
+                terminate_popen(proc)
+                return
+
+            GLib.idle_add(
+                self.mark_live_log_started,
+                session_id,
+                command_text(command),
+                LIVE_LOG_COMMAND,
+            )
+
+            for line in proc.stdout or []:
+                if session_id != self.live_log_session_id:
+                    break
+                GLib.idle_add(self.append_live_log_line, session_id, line)
+
+            if session_id != self.live_log_session_id and proc.poll() is None:
+                terminate_popen(proc)
+
+            try:
+                return_code = proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                terminate_popen(proc)
+                return_code = proc.returncode if proc.returncode is not None else -1
+        except Exception as exc:
+            error = str(exc)
+            return_code = 1
+        finally:
+            if proc:
+                unregister_process(proc.pid)
+
+        if session_id == self.live_log_session_id:
+            GLib.idle_add(self.finish_live_log_process, session_id, return_code, error)
+
+    def mark_live_log_started(self, session_id, command_display, source_label):
+        if session_id != self.live_log_session_id:
+            return False
+        self.live_log_starting = False
+        self.live_log_running = True
+        self.set_live_log_status(f"Đang đọc log hệ thống realtime | {source_label}")
+        self.update_live_log_controls()
+        self.append_live_log_line(
+            session_id,
+            f"[{time.strftime('%H:%M:%S')}] Lệnh đang chạy: {command_display}\n",
+        )
+        return False
+
+    def append_live_log_line(self, session_id, line):
+        if session_id != self.live_log_session_id or not hasattr(self, "live_log_text"):
+            return False
+
+        text = ANSI_ESCAPE_PATTERN.sub("", str(line or "")).replace("\r", "\n")
+        if not text:
+            return False
+        if not text.endswith("\n"):
+            text += "\n"
+
+        buffer = self.live_log_text.get_buffer()
+        start_iter, end_iter = buffer.get_bounds()
+        current_text = buffer.get_text(start_iter, end_iter, True).strip()
+        if current_text.startswith("Chưa có log."):
+            buffer.set_text("")
+
+        end_iter = buffer.get_end_iter()
+        buffer.insert(end_iter, text)
+
+        overage = buffer.get_char_count() - LIVE_LOG_MAX_CHARS
+        if overage > 0:
+            trim_start = buffer.get_start_iter()
+            trim_end = buffer.get_iter_at_offset(overage)
+            trim_end.forward_line()
+            buffer.delete(trim_start, trim_end)
+
+        end_iter = buffer.get_end_iter()
+        mark = buffer.create_mark(None, end_iter, False)
+        self.live_log_text.scroll_mark_onscreen(mark)
+        buffer.delete_mark(mark)
+        return False
+
+    def finish_live_log_start_failed(self, session_id, message):
+        if session_id != self.live_log_session_id:
+            return False
+        self.live_log_starting = False
+        self.live_log_running = False
+        self.live_log_proc = None
+        self.set_live_log_status(message)
+        self.update_live_log_controls()
+        return False
+
+    def finish_live_log_process(self, session_id, return_code, error):
+        if session_id != self.live_log_session_id:
+            return False
+        self.live_log_starting = False
+        self.live_log_running = False
+        self.live_log_proc = None
+        if error:
+            self.set_live_log_status(f"Log realtime lỗi: {error}")
+        elif return_code == 0:
+            self.set_live_log_status("Log realtime đã dừng.")
+        else:
+            self.set_live_log_status(f"Log realtime đã dừng, mã lỗi {return_code}.")
+        self.update_live_log_controls()
+        return False
+
+    def stop_live_log(self, _button=None):
+        return self.stop_live_log_process("Đã dừng Log realtime.", manual=True)
+
+    def stop_live_log_process(self, message=None, manual=False):
+        if manual:
+            self.live_log_manual_stopped = True
+        self.live_log_session_id += 1
+        proc = self.live_log_proc
+        self.live_log_proc = None
+        was_active = self.live_log_running or self.live_log_starting or proc is not None
+        self.live_log_running = False
+        self.live_log_starting = False
+        if proc:
+            terminate_popen(proc)
+        if message and hasattr(self, "live_log_status_label"):
+            self.set_live_log_status(message if was_active else "Không có Log realtime đang chạy.")
+        self.update_live_log_controls()
+        return False
+
+    def cleanup_live_log_on_destroy(self, _window):
+        self.stop_live_log_process(manual=False)
 
     def update_file_buttons(self):
         item = self.selected_remote_item
@@ -3488,6 +4098,24 @@ class AdapterStatus(Gtk.Window):
         self.store_current_config()
         return self.run_get_root(self.config, debug_path)
 
+    def drop_root(self, _button):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+        if self.file_running or self.video_running:
+            self.set_action_text("Đang có thao tác file/video chạy. Dừng thao tác đó trước khi Thoát Root.")
+            return False
+        if not self.adb_ready_for_file_refresh():
+            self.set_action_text("ADB chưa ở trạng thái device nên chưa thể Thoát Root.")
+            return False
+        if not self.last_status.get("root_ok"):
+            root_output = self.last_status.get("root_output") or "uid khác 0"
+            self.set_action_text(f"Thiết bị đang chưa root.\n{root_output}")
+            return False
+
+        self.store_current_config()
+        return self.run_drop_root(self.config)
+
     def run_get_root(self, config, debug_path):
         if self.action_running:
             self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
@@ -3501,6 +4129,7 @@ class AdapterStatus(Gtk.Window):
         self.action_running = True
         self.set_banner("ĐANG GET ROOT...", "warn")
         self.set_get_root_button_ready(False, False)
+        self.set_drop_root_button_ready(False, False)
         self.set_terminal_button_ready(False)
 
         log_lines = []
@@ -3519,6 +4148,42 @@ class AdapterStatus(Gtk.Window):
                 result = get_root_with_debug_file(config, debug_path, log=append_log)
             except Exception as exc:
                 result = f"Lỗi không xử lý khi Get Root: {exc}"
+            append_log(f"Kết quả: {result}")
+            GLib.idle_add(self.finish_action, "\n".join(log_lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def run_drop_root(self, config):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        if self.live_log_running or self.live_log_starting:
+            self.stop_live_log_process("Đã dừng Log realtime trước khi Thoát Root.", manual=False)
+
+        self.action_running = True
+        self.set_banner("ĐANG THOÁT ROOT...", "warn")
+        self.set_get_root_button_ready(False, False)
+        self.set_drop_root_button_ready(False, False)
+        self.set_terminal_button_ready(False)
+
+        log_lines = []
+
+        def append_log(message):
+            text = clean_command_output(str(message or ""))
+            if not text:
+                return
+            log_lines.append(f"[{time.strftime('%H:%M:%S')}] {text}")
+            GLib.idle_add(self.set_action_text, "\n".join(log_lines))
+
+        append_log("Đang chuẩn bị Thoát Root...")
+
+        def worker():
+            try:
+                result = drop_adb_root(config, log=append_log)
+            except Exception as exc:
+                result = f"Lỗi không xử lý khi Thoát Root: {exc}"
             append_log(f"Kết quả: {result}")
             GLib.idle_add(self.finish_action, "\n".join(log_lines))
 
@@ -3555,6 +4220,9 @@ class AdapterStatus(Gtk.Window):
         if self.action_running:
             self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
             return False
+
+        if self.live_log_running or self.live_log_starting:
+            self.stop_live_log_process("Đã dừng Log realtime trước khi reconnect ADB.", manual=False)
 
         self.action_running = True
         self.set_banner("ĐANG CONNECT ADB...", "warn")
@@ -3682,9 +4350,15 @@ class AdapterStatus(Gtk.Window):
         self.set_banner(status["banner_text"], status["banner_state"])
         self.set_terminal_button_ready(status.get("adb_ok", False))
         self.set_get_root_button_ready(status.get("adb_ok", False), status.get("root_ok", False))
+        self.set_drop_root_button_ready(status.get("adb_ok", False), status.get("root_ok", False))
+        self.update_live_log_controls(status)
+        if (self.live_log_running or self.live_log_starting) and not self.live_log_root_ready(status):
+            self.stop_live_log_process("ADB/root không còn sẵn sàng, đã dừng Log realtime.", manual=False)
+        elif self.notebook.get_current_page() == getattr(self, "live_log_page_num", -1):
+            self.update_live_log_idle_status(status)
 
         self.set_details_text(status["details"])
-        self.set_device_info_text(status.get("device_info", DEVICE_INFO_EMPTY_TEXT))
+        self.set_device_info_line(status.get("device_info", DEVICE_INFO_EMPTY_TEXT))
         return False
 
     def set_get_root_button_ready(self, adb_ready, root_ok=False):
@@ -3716,6 +4390,30 @@ class AdapterStatus(Gtk.Window):
             ctx.add_class("root-ok")
         else:
             ctx.add_class("root-needed")
+
+    def set_drop_root_button_ready(self, adb_ready, root_ok=False):
+        if not hasattr(self, "drop_root_button"):
+            return
+        blocked_by_action = self.action_running
+        adb_ready = bool(adb_ready)
+        root_ok = bool(root_ok) and adb_ready
+        ready = adb_ready and root_ok and not blocked_by_action
+
+        self.drop_root_button.set_sensitive(ready)
+        if blocked_by_action:
+            tooltip = "Đang chạy thao tác khác."
+        elif not adb_ready:
+            tooltip = "ADB chưa connect."
+        elif not root_ok:
+            tooltip = "Thiết bị đang chưa root."
+        else:
+            tooltip = "Chạy adb unroot để về user adb và test Get Root lại."
+        self.drop_root_button.set_tooltip_text(tooltip)
+
+        ctx = self.drop_root_button.get_style_context()
+        for css_class in ("unroot-ready", "unroot-wait"):
+            ctx.remove_class(css_class)
+        ctx.add_class("unroot-ready" if ready else "unroot-wait")
 
     def set_terminal_button_ready(self, ready):
         blocked_by_action = self.action_running
