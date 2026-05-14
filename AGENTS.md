@@ -1,26 +1,32 @@
+
+Before writing code:
+
+* Design the architecture first
+* Explain module dependencies
+* Explain data flow
+* Only then generate the code
+
+
 # Repository Guidelines
 
 ## Project Structure & Module Organization
 This repository is an operational BLTN ADB and debug-update workspace, not a conventional library package.
 
-- `adapter-status-ui`: GTK3 Python app for adapter, ADB, root, and file explorer workflows.
-- `adb.sh`: current Linux ADB connection script; packaged copy is `adapter-status-package/adb.sh`.
-- `adapter-status-package/`: distributable UI, desktop launcher, script, and README.
-- `README_ADB.md`, `how to check version.md`, `hướng dẫn update file debug lấy quyền root.md`, and `.docx` files: operator documentation.
-- `*.bin`, `vrs_update_info`, `YOEUK_public*.pem`, and `ecu-files/`: payloads, public keys, and collected ECU data. Preserve exact filenames.
-- `adbscript_linux.sh` and `adbscript_window.bat`: legacy setup scripts.
+- `adapter-status-ui`: thin launcher for the GTK3 app.
+- `adapter_status/`: Python package split into UI, service/business logic, ADB execution, config, and process helpers.
+- `docs/`: operator documentation, architecture notes, Markdown guides, reports, `.docx` source files, ADB helper scripts, payloads, and public keys.
+- `docs/adb.sh`: current Linux ADB connection script.
+- `docs/*.bin`, `docs/vrs_update_info`, `docs/YOEUK_public*.pem`, and `ecu-files/`: payloads, public keys, and collected ECU data. Preserve exact filenames.
+- `docs/adbscript_linux.sh` and `docs/adbscript_window.bat`: legacy setup scripts.
 
 Avoid editing generated files such as `__pycache__/` or runtime scratch data under `.test-home/`.
 
 ## Build, Test, and Development Commands
 
 - `python3 ./adapter-status-ui`: run the GTK status app locally.
-- `./adb.sh`: configure the USB Ethernet interface, connect to ADB, then open `adb shell`.
-- `bash -n adb.sh adbscript_linux.sh`: syntax-check shell scripts.
-- `python3 -m py_compile adapter-status-ui adapter-status-package/adapter-status-ui`: syntax-check Python UI files.
-- `tar -czf adapter-status-package.tar.gz adapter-status-package`: rebuild the package archive after updating packaged files.
-
-When root files also exist in `adapter-status-package/`, update both copies and verify with `cmp -s`.
+- `bash docs/adb.sh`: configure the USB Ethernet interface, connect to ADB, then open `adb shell`.
+- `bash -n docs/adb.sh docs/adbscript_linux.sh`: syntax-check shell scripts.
+- `python3 -m py_compile adapter-status-ui adapter_status/*.py adapter_status/adb/*.py adapter_status/services/*.py adapter_status/ui/*.py`: syntax-check Python UI/package files.
 
 ## Coding Style & Naming Conventions
 
