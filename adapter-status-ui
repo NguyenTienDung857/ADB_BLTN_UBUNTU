@@ -34,6 +34,9 @@ DEFAULT_CONFIG = {
     "adb_port": "4321",
 }
 CONNECT_WINDOW_SECONDS = 60.0
+ROOT_WAIT_SECONDS = 120.0
+ROOT_UPDATE_REMOTE_PATH = "/tmp/cpu_update.bin"
+ROOT_CHANGE_FILE_COMMAND = "cd /home/adb && ./change_file"
 REMOTE_PREVIEW_LIMIT = 32768
 FILE_EXPLORER_TIMEOUT = 10
 FILE_EXPLORER_AUTO_REFRESH_SECONDS = 30
@@ -112,6 +115,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ADB_WORKDIR = os.path.expanduser("~/BLTN_ADB")
 IFACE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 USB_IFACE_PATTERN = re.compile(r"enx[0-9A-Fa-f]{12}")
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 HELP_TEXT = """HƯỚNG DẪN SỬ DỤNG ADAPTER STATUS
 
@@ -157,11 +161,14 @@ Quy trình khi rút/cắm lại cổng
 - ĐANG CHỜ BLTN LÊN MẠNG: IP trên máy đã có nhưng chưa thấy thiết bị 192.168.244.1.
 - ADB CHƯA CONNECT - BẤM ADB CONNECT: mạng đã OK nhưng ADB chưa connect.
 - CONNECTED - ADB READY: kết nối đầy đủ, có thể dùng adb shell.
+- CONNECTED - ADB ROOT READY: ADB đã connect và adb shell id đang trả uid=0(root).
 
 Các nút thao tác
 - Cấu hình IP: gán IP adapter cho cổng đang chọn và bật cổng lên.
 - ADB Connect: gán lại IP, dọn ADB cũ/treo, rồi canh bắt ADB trong 60 giây.
 - Mở Terminal: chỉ sáng khi ADB đã connect; mở terminal tại thư mục app và chạy ./adb.sh.
+- Get Root: khi ADB đã connect nhưng chưa root, nút màu đỏ; chọn file DEBUG...bin rồi app tự push, chạy update cpu, chạy change_file và chờ thiết bị tự reboot.
+- Root OK: khi adb shell id trả uid=0(root), nút đổi màu xanh để báo thiết bị đã có quyền root.
 - Help: mở hướng dẫn này.
 
 Tab File Explorer
@@ -296,6 +303,21 @@ def command_name(command):
 
 def command_text(command):
     return " ".join(str(part) for part in command)
+
+
+def clean_command_output(text):
+    cleaned = ANSI_ESCAPE_PATTERN.sub("", text or "")
+    cleaned = cleaned.replace("\r", "\n")
+    lines = [line.rstrip() for line in cleaned.splitlines()]
+    compact = []
+    previous_blank = False
+    for line in lines:
+        blank = not line.strip()
+        if blank and previous_blank:
+            continue
+        compact.append(line)
+        previous_blank = blank
+    return "\n".join(compact).strip()
 
 
 def proc_cmdline(pid):
@@ -635,6 +657,51 @@ def run(command, timeout=2, purpose="command"):
         except Exception:
             output = ""
         text = (output or "").strip()
+        if text:
+            text += "\n"
+        return 124, f"{text}Command timeout: {command_text(command)}"
+    except Exception as exc:
+        return 1, str(exc)
+    finally:
+        if is_adb_command:
+            register_new_adb_servers(adb_servers_before)
+        if proc:
+            unregister_process(proc.pid)
+
+
+def run_with_input(command, input_text, timeout=10, purpose="command"):
+    is_adb_command = command_name(command) == "adb"
+    adb_servers_before = tracked_adb_server_pids() if is_adb_command else set()
+    proc = None
+    record = None
+    try:
+        proc = subprocess.Popen(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=adb_env(),
+            start_new_session=True,
+        )
+        record = register_process(proc.pid, command, purpose)
+        output, _stderr = proc.communicate(input=input_text, timeout=timeout)
+        return proc.returncode, clean_command_output(output)
+    except subprocess.TimeoutExpired:
+        if record:
+            kill_tracked_record(record)
+        elif proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            output, _stderr = proc.communicate(timeout=1)
+        except Exception:
+            output = ""
+        text = clean_command_output(output)
         if text:
             text += "\n"
         return 124, f"{text}Command timeout: {command_text(command)}"
@@ -1477,6 +1544,234 @@ def append_command_output(outputs, label, code, output):
         outputs.append(f"{label} lỗi ({code}).")
 
 
+def is_root_id_output(output):
+    return bool(re.search(r"\buid=0(?:\(|\b)", output or ""))
+
+
+def validate_debug_bin_path(path):
+    if not path:
+        return "Chưa chọn file debug .bin."
+    if not os.path.isfile(path):
+        return f"Không thấy file: {path}"
+    if not path.lower().endswith(".bin"):
+        return "File được chọn không phải .bin."
+    if os.path.getsize(path) <= 0:
+        return f"File rỗng: {path}"
+    return None
+
+
+def wait_for_adb_device(config, wait_seconds=10.0, log=None, purpose="adb-wait"):
+    target = adb_target(config)
+    deadline = time.monotonic() + wait_seconds
+    last_state = ""
+    last_devices = ""
+
+    while time.monotonic() < deadline:
+        code, devices = run(["adb", "devices"], timeout=2, purpose=f"{purpose}-state")
+        last_devices = clean_command_output(devices)
+        state = adb_state_from_devices(devices, target) if code == 0 else ""
+        if state != last_state and log:
+            log(f"ADB state: {state or 'chưa thấy thiết bị'}")
+        last_state = state
+        if state == "device":
+            return state, last_devices
+
+        if state == "offline":
+            run(["adb", "disconnect", target], timeout=2, purpose=f"{purpose}-disconnect")
+        run(["adb", "connect", target], timeout=4, purpose=f"{purpose}-connect")
+        time.sleep(1.0)
+
+    return last_state, last_devices
+
+
+def run_cmdtool_update_cpu(config, log=None):
+    target = adb_target(config)
+    last_code = 1
+    last_output = ""
+
+    for attempt in range(1, 3):
+        if attempt > 1:
+            if log:
+                log("ADB/cmdtool chưa ổn, thử connect lại rồi chạy update cpu lần nữa.")
+            state, devices = wait_for_adb_device(
+                config,
+                wait_seconds=10.0,
+                log=log,
+                purpose="get-root-cmdtool-retry",
+            )
+            if state != "device":
+                return False, last_code, (
+                    f"ADB chưa sẵn sàng để retry cmdtool. State: {state or 'not connected'}\n"
+                    f"{devices}"
+                ).strip()
+
+        code, output = run_with_input(
+            ["adb", "-s", target, "shell", "cmdtool"],
+            "update cpu\n",
+            timeout=20,
+            purpose="get-root-cmdtool",
+        )
+        output = clean_command_output(output)
+        last_code = code
+        last_output = output
+        if output and log:
+            log(output)
+
+        if "command status = 0" in output.lower():
+            if code == 124 and log:
+                log("cmdtool đã báo status=0 nhưng không tự thoát; app đã đóng phiên cmdtool.")
+            return True, code, output
+
+        transient = "offline" in output.lower() or "cannot connect to daemon" in output.lower()
+        if not transient:
+            break
+
+    return False, last_code, last_output
+
+
+def wait_for_root_after_reboot(config, log=None):
+    target = adb_target(config)
+    deadline = time.monotonic() + ROOT_WAIT_SECONDS
+    next_configure_at = 0.0
+    next_connect_at = 0.0
+    last_state = None
+    first_non_root_at = None
+    last_id_output = ""
+    last_devices = ""
+
+    if log:
+        log(f"Chờ thiết bị reboot và ADB lên lại tối đa {int(ROOT_WAIT_SECONDS)} giây...")
+
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+
+        if now >= next_configure_at:
+            for command in configure_ip_commands(config):
+                code, output = run(command, timeout=3, purpose="get-root-ip")
+                if code != 0 and output and log:
+                    log(f"Cấu hình IP chưa OK: {clean_command_output(output)}")
+                    break
+            next_configure_at = now + 5.0
+
+        if now >= next_connect_at:
+            code, output = run(["adb", "connect", target], timeout=4, purpose="get-root-connect")
+            if output and log and code == 0 and "already connected" not in output.lower():
+                log(clean_command_output(output))
+            next_connect_at = now + 2.0
+
+        code, devices = run(["adb", "devices"], timeout=2, purpose="get-root-state")
+        last_devices = devices
+        state = adb_state_from_devices(devices, target) if code == 0 else ""
+        if state != last_state:
+            if log:
+                log(f"ADB state: {state or 'chưa thấy thiết bị'}")
+            last_state = state
+
+        if state == "device":
+            code, id_output = run(
+                ["adb", "-s", target, "shell", "id"],
+                timeout=5,
+                purpose="get-root-id",
+            )
+            last_id_output = clean_command_output(id_output)
+            if last_id_output and log:
+                log(f"id: {last_id_output}")
+            if code == 0 and is_root_id_output(last_id_output):
+                return True, "Get Root thành công: thiết bị đang chạy với uid=0(root)."
+            if first_non_root_at is None:
+                first_non_root_at = now
+            elif now - first_non_root_at > 20:
+                return (
+                    False,
+                    "ADB đã lên lại nhưng chưa có root.\n"
+                    f"id cuối cùng: {last_id_output or 'không đọc được'}",
+                )
+
+        time.sleep(1.0)
+
+    message = "Hết thời gian chờ thiết bị lên lại sau Get Root."
+    if last_state:
+        message += f"\nADB state cuối: {last_state}"
+    if last_id_output:
+        message += f"\nid cuối: {last_id_output}"
+    if last_devices:
+        message += f"\nadb devices cuối:\n{last_devices}"
+    return False, message
+
+
+def get_root_with_debug_file(config, debug_path, log=None):
+    validation_error = validate_debug_bin_path(debug_path)
+    if validation_error:
+        return validation_error
+
+    target = adb_target(config)
+    debug_size = os.path.getsize(debug_path)
+
+    def emit(message):
+        if log:
+            log(message)
+
+    emit("Bắt đầu Get Root.")
+    emit(f"ADB target: {target}")
+    emit(f"File debug: {debug_path}")
+    emit(f"Size: {human_size(debug_size)}")
+
+    emit("Kiểm tra ADB:")
+    state, devices_output = wait_for_adb_device(
+        config,
+        wait_seconds=10.0,
+        log=emit,
+        purpose="get-root-precheck",
+    )
+    if devices_output:
+        emit(devices_output)
+    if state != "device":
+        return f"ADB chưa sẵn sàng. State: {state or 'not connected'}"
+
+    code, id_output = run(["adb", "-s", target, "shell", "id"], timeout=5, purpose="get-root-id-before")
+    id_output = clean_command_output(id_output)
+    if id_output:
+        emit(f"id trước khi chạy: {id_output}")
+    if code == 0 and is_root_id_output(id_output):
+        return "Thiết bị đã có root sẵn: uid=0(root). Không cần chạy update debug."
+
+    emit(f"Đẩy file debug vào thiết bị: {ROOT_UPDATE_REMOTE_PATH}")
+    code, output = run(
+        ["adb", "-s", target, "push", debug_path, ROOT_UPDATE_REMOTE_PATH],
+        timeout=30,
+        purpose="get-root-push-debug",
+    )
+    output = clean_command_output(output)
+    if output:
+        emit(output)
+    if code != 0:
+        return f"Push file debug lỗi ({code}).\n{output}"
+
+    emit("Chạy cmdtool: update cpu")
+    update_ok, code, output = run_cmdtool_update_cpu(config, log=emit)
+    if not update_ok:
+        return f"cmdtool update cpu chưa báo thành công ({code}).\n{output}"
+
+    emit("Chạy /home/adb/change_file để đổi quyền root và reboot.")
+    code, output = adb_shell(
+        config,
+        ROOT_CHANGE_FILE_COMMAND,
+        timeout=30,
+        purpose="get-root-change-file",
+    )
+    output = clean_command_output(output)
+    if output:
+        emit(output)
+    change_ok = "rebooting" in output.lower() or "setuid/setgid" in output.lower()
+    if code != 0 and not change_ok:
+        return f"change_file lỗi ({code}).\n{output}"
+
+    emit("Nếu change_file báo Rebooting, không cần reset tay; app đang chờ thiết bị tự lên lại.")
+    time.sleep(5)
+    ok, message = wait_for_root_after_reboot(config, log=emit)
+    return message if ok else f"Get Root chưa thành công.\n{message}"
+
+
 def adb_reconnect(config):
     target = adb_target(config)
     outputs = [f"Đang canh ADB tối đa {int(CONNECT_WINDOW_SECONDS)} giây: {target}"]
@@ -1696,6 +1991,8 @@ def collect_status(config):
     adb_ok = False
     adb_state = ""
     adb_output = "Bỏ qua vì cổng chưa có IP."
+    root_ok = False
+    root_output = ""
     if exists and carrier == "1" and has_expected_ip:
         if tracked_adb_server_pids():
             _code, adb_output = run(["adb", "devices"], timeout=2, purpose="status")
@@ -1704,12 +2001,23 @@ def collect_status(config):
         else:
             adb_output = "ADB server chưa chạy."
 
+    if adb_ok:
+        root_code, root_output = run(
+            ["adb", "-s", target, "shell", "id"],
+            timeout=2,
+            purpose="status-root",
+        )
+        root_output = clean_command_output(root_output)
+        root_ok = root_code == 0 and is_root_id_output(root_output)
+
     if not exists:
         banner = ("CHƯA THẤY ADAPTER", "bad")
     elif carrier != "1":
         banner = ("CHƯA CẮM / CHƯA CÓ LINK", "bad")
     elif not has_expected_ip:
         banner = (f"CÓ LINK, CHƯA CÓ IP {host_ip} - BẤM ADB CONNECT", "warn")
+    elif adb_ok and root_ok:
+        banner = ("CONNECTED - ADB ROOT READY", "ok")
     elif adb_ok:
         banner = ("CONNECTED - ADB READY", "ok")
     elif not ping_ok:
@@ -1732,7 +2040,27 @@ def collect_status(config):
         "ADB port: không probe trực tiếp để tránh làm nhiễu adbd",
         f"ADB target: {target}",
         f"ADB status: {adb_state or ('device' if adb_ok else 'chưa kết nối')}",
-        f"Gợi ý: {'Bấm ADB Connect để app tự gán IP và canh ADB.' if not adb_ok else 'Có thể bấm Mở Terminal.'}",
+        (
+            "Root status: "
+            + (
+                "OK - uid=0(root)"
+                if root_ok
+                else "Chưa root"
+                if adb_ok
+                else "Bỏ qua vì ADB chưa device"
+            )
+        ),
+        f"id output: {root_output}" if adb_ok and root_output else None,
+        (
+            "Gợi ý: "
+            + (
+                "Bấm ADB Connect để app tự gán IP và canh ADB."
+                if not adb_ok
+                else "Đã có root, có thể bấm Mở Terminal hoặc dùng File Explorer."
+                if root_ok
+                else "Bấm Get Root để chọn file debug và lấy quyền root."
+            )
+        ),
         f"Cập nhật lúc: {time.strftime('%H:%M:%S')}",
     ]
     details = [line for line in details if line is not None]
@@ -1745,6 +2073,8 @@ def collect_status(config):
         "adb_output": adb_output,
         "adb_ok": adb_ok,
         "adb_state": adb_state,
+        "root_ok": root_ok,
+        "root_output": root_output,
         "exists": exists,
         "carrier_ok": carrier == "1",
         "has_expected_ip": has_expected_ip,
@@ -1815,6 +2145,9 @@ class AdapterStatus(Gtk.Window):
             button.compact-button { padding: 2px 8px; border-radius: 7px; }
             button.terminal-ready { background-image: none; background-color: #059669; color: #ecfdf5; font-weight: 700; }
             button.terminal-wait { color: #6b7280; }
+            button.root-needed { background-image: none; background-color: #b91c1c; color: #fef2f2; font-weight: 700; }
+            button.root-ok { background-image: none; background-color: #059669; color: #ecfdf5; font-weight: 700; }
+            button.root-wait { color: #6b7280; }
             """
         )
         Gtk.StyleContext.add_provider_for_screen(
@@ -1872,16 +2205,23 @@ class AdapterStatus(Gtk.Window):
         connect.connect("clicked", self.connect_adb)
         buttons.attach(connect, 1, 0, 1, 1)
 
+        self.get_root_button = Gtk.Button(label="Get Root")
+        self.get_root_button.set_sensitive(False)
+        self.get_root_button.get_style_context().add_class("root-wait")
+        self.get_root_button.set_tooltip_text("ADB chưa connect.")
+        self.get_root_button.connect("clicked", self.choose_debug_file_for_root)
+        buttons.attach(self.get_root_button, 2, 0, 1, 1)
+
         self.open_terminal_button = Gtk.Button(label="Mở Terminal")
         self.open_terminal_button.set_sensitive(False)
         self.open_terminal_button.get_style_context().add_class("terminal-wait")
         self.open_terminal_button.set_tooltip_text("ADB chưa connect.")
         self.open_terminal_button.connect("clicked", self.open_terminal)
-        buttons.attach(self.open_terminal_button, 2, 0, 1, 1)
+        buttons.attach(self.open_terminal_button, 3, 0, 1, 1)
 
         help_button = Gtk.Button(label="Help")
         help_button.connect("clicked", self.show_help)
-        buttons.attach(help_button, 3, 0, 1, 1)
+        buttons.attach(help_button, 4, 0, 1, 1)
 
         for child in buttons.get_children():
             child.set_hexpand(True)
@@ -2922,6 +3262,92 @@ class AdapterStatus(Gtk.Window):
         self.store_current_config()
         self.run_adb_reconnect(self.config)
 
+    def choose_debug_file_for_root(self, _button):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+        if self.file_running or self.video_running:
+            self.set_action_text("Đang có thao tác file/video chạy. Dừng thao tác đó trước khi Get Root.")
+            return False
+        if not self.adb_ready_for_file_refresh():
+            self.set_action_text("ADB chưa ở trạng thái device nên chưa thể Get Root.")
+            return False
+        if self.last_status.get("root_ok"):
+            root_output = self.last_status.get("root_output") or "uid=0(root)"
+            self.set_action_text(f"Thiết bị đã có quyền root.\n{root_output}")
+            return False
+
+        dialog = Gtk.FileChooserDialog(
+            title="Chọn file debug .bin để Get Root",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.set_modal(True)
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            "Chọn file",
+            Gtk.ResponseType.OK,
+        )
+        dialog.set_current_folder(adb_workdir())
+
+        debug_filter = Gtk.FileFilter()
+        debug_filter.set_name("Debug bin (*.bin)")
+        debug_filter.add_pattern("*.bin")
+        debug_filter.add_pattern("*.BIN")
+        dialog.add_filter(debug_filter)
+
+        all_filter = Gtk.FileFilter()
+        all_filter.set_name("Tất cả file")
+        all_filter.add_pattern("*")
+        dialog.add_filter(all_filter)
+
+        response = dialog.run()
+        debug_path = dialog.get_filename() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        if not debug_path:
+            return False
+
+        self.store_current_config()
+        return self.run_get_root(self.config, debug_path)
+
+    def run_get_root(self, config, debug_path):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        validation_error = validate_debug_bin_path(debug_path)
+        if validation_error:
+            self.set_action_text(validation_error)
+            return False
+
+        self.action_running = True
+        self.set_banner("ĐANG GET ROOT...", "warn")
+        self.set_get_root_button_ready(False, False)
+        self.set_terminal_button_ready(False)
+
+        log_lines = []
+
+        def append_log(message):
+            text = clean_command_output(str(message or ""))
+            if not text:
+                return
+            log_lines.append(f"[{time.strftime('%H:%M:%S')}] {text}")
+            GLib.idle_add(self.set_action_text, "\n".join(log_lines))
+
+        append_log("Đang chuẩn bị quy trình Get Root...")
+
+        def worker():
+            try:
+                result = get_root_with_debug_file(config, debug_path, log=append_log)
+            except Exception as exc:
+                result = f"Lỗi không xử lý khi Get Root: {exc}"
+            append_log(f"Kết quả: {result}")
+            GLib.idle_add(self.finish_action, "\n".join(log_lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
     def reset_all(self, _button=None):
         self.store_current_config()
         self.run_clean_reset(self.config, include_current=True, startup=False)
@@ -3078,14 +3504,51 @@ class AdapterStatus(Gtk.Window):
         self.last_status = dict(status)
         self.set_banner(status["banner_text"], status["banner_state"])
         self.set_terminal_button_ready(status.get("adb_ok", False))
+        self.set_get_root_button_ready(status.get("adb_ok", False), status.get("root_ok", False))
 
         self.set_details_text(status["details"])
         return False
 
+    def set_get_root_button_ready(self, adb_ready, root_ok=False):
+        if not hasattr(self, "get_root_button"):
+            return
+        blocked_by_action = self.action_running
+        adb_ready = bool(adb_ready)
+        root_ok = bool(root_ok) and adb_ready
+        ready = adb_ready and not blocked_by_action
+
+        self.get_root_button.set_label("Root OK" if root_ok else "Get Root")
+        self.get_root_button.set_sensitive(ready)
+        if blocked_by_action:
+            tooltip = "Đang chạy thao tác khác."
+        elif not adb_ready:
+            tooltip = "ADB chưa connect."
+        elif root_ok:
+            tooltip = "Thiết bị đã có quyền root."
+        else:
+            tooltip = "Chọn file DEBUG...bin và chạy quy trình lấy root."
+        self.get_root_button.set_tooltip_text(tooltip)
+
+        ctx = self.get_root_button.get_style_context()
+        for css_class in ("root-ready", "root-needed", "root-ok", "root-wait"):
+            ctx.remove_class(css_class)
+        if not ready:
+            ctx.add_class("root-wait")
+        elif root_ok:
+            ctx.add_class("root-ok")
+        else:
+            ctx.add_class("root-needed")
+
     def set_terminal_button_ready(self, ready):
+        blocked_by_action = self.action_running
+        ready = bool(ready) and not blocked_by_action
         self.open_terminal_button.set_sensitive(ready)
         self.open_terminal_button.set_tooltip_text(
-            "Mở terminal và chạy ./adb.sh" if ready else "ADB chưa connect."
+            "Mở terminal và chạy ./adb.sh"
+            if ready
+            else "Đang chạy thao tác khác."
+            if blocked_by_action
+            else "ADB chưa connect."
         )
         ctx = self.open_terminal_button.get_style_context()
         for css_class in ("terminal-ready", "terminal-wait"):

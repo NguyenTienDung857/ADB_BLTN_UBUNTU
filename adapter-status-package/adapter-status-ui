@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import glob
+import http.server
 import json
 import os
+import posixpath
 import re
 import signal
+import shlex
 import shutil
 import socket
 import subprocess
@@ -13,7 +16,8 @@ import time
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk, Pango
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
 
 
 CONFIG_DIR = os.path.expanduser("~/.config/adapter-status")
@@ -30,11 +34,88 @@ DEFAULT_CONFIG = {
     "adb_port": "4321",
 }
 CONNECT_WINDOW_SECONDS = 60.0
+ROOT_WAIT_SECONDS = 120.0
+ROOT_UPDATE_REMOTE_PATH = "/tmp/cpu_update.bin"
+ROOT_CHANGE_FILE_COMMAND = "cd /home/adb && ./change_file"
+REMOTE_PREVIEW_LIMIT = 32768
+FILE_EXPLORER_TIMEOUT = 10
+FILE_EXPLORER_AUTO_REFRESH_SECONDS = 30
+VIDEO_STREAM_CHUNK_SIZE = 262144
+IMAGE_PREVIEW_MAX_BYTES = 50 * 1024 * 1024
+IMAGE_PREVIEW_MAX_WIDTH = 1200
+IMAGE_PREVIEW_MAX_HEIGHT = 800
+IMAGE_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".gif",
+    ".webp",
+    ".tif",
+    ".tiff",
+)
+VIDEO_EXTENSIONS = (
+    ".mp4",
+    ".m4v",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".ts",
+    ".m2ts",
+    ".webm",
+    ".3gp",
+    ".mpeg",
+    ".mpg",
+    ".h264",
+    ".h265",
+    ".264",
+    ".265",
+)
+TEXT_EXTENSIONS = (
+    ".txt",
+    ".log",
+    ".dlt",
+    ".conf",
+    ".cfg",
+    ".ini",
+    ".json",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".csv",
+    ".sh",
+    ".rc",
+)
+DATABASE_EXTENSIONS = (
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+)
+FILE_LIST_ICON_SIZE = 24
+FILE_GRID_ICON_DEFAULT_SIZE = 88
+
+FILE_COL_LIST_ICON = 0
+FILE_COL_GRID_ICON = 1
+FILE_COL_NAME = 2
+FILE_COL_GRID_LABEL = 3
+FILE_COL_KIND_LABEL = 4
+FILE_COL_SIZE_TEXT = 5
+FILE_COL_PERMISSIONS = 6
+FILE_COL_OWNER_GROUP = 7
+FILE_COL_MODIFIED = 8
+FILE_COL_PATH = 9
+FILE_COL_IS_DIR = 10
+FILE_COL_SIZE = 11
+FILE_COL_GROUP = 12
+FILE_COL_KIND = 13
+FILE_COL_LINK_TARGET = 14
+FILE_COL_ICON_NAME = 15
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ADB_WORKDIR = os.path.expanduser("~/BLTN_ADB")
 IFACE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 USB_IFACE_PATTERN = re.compile(r"enx[0-9A-Fa-f]{12}")
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 HELP_TEXT = """HƯỚNG DẪN SỬ DỤNG ADAPTER STATUS
 
@@ -80,12 +161,31 @@ Quy trình khi rút/cắm lại cổng
 - ĐANG CHỜ BLTN LÊN MẠNG: IP trên máy đã có nhưng chưa thấy thiết bị 192.168.244.1.
 - ADB CHƯA CONNECT - BẤM ADB CONNECT: mạng đã OK nhưng ADB chưa connect.
 - CONNECTED - ADB READY: kết nối đầy đủ, có thể dùng adb shell.
+- CONNECTED - ADB ROOT READY: ADB đã connect và adb shell id đang trả uid=0(root).
 
 Các nút thao tác
 - Cấu hình IP: gán IP adapter cho cổng đang chọn và bật cổng lên.
 - ADB Connect: gán lại IP, dọn ADB cũ/treo, rồi canh bắt ADB trong 60 giây.
 - Mở Terminal: chỉ sáng khi ADB đã connect; mở terminal tại thư mục app và chạy ./adb.sh.
+- Get Root: khi ADB đã connect nhưng chưa root, nút màu đỏ; chọn file DEBUG...bin rồi app tự push, chạy update cpu, chạy change_file và chờ thiết bị tự reboot.
+- Root OK: khi adb shell id trả uid=0(root), nút đổi màu xanh để báo thiết bị đã có quyền root.
 - Help: mở hướng dẫn này.
+
+Tab File Explorer
+- Chỉ dùng khi ADB status là device.
+- Khi bấm tab File Explorer và ADB đang là device, app tự Refresh đường dẫn hiện tại.
+- Khi ADB đang là device, app tự đồng bộ lại thư mục hiện tại mỗi 30 giây.
+- Có thể nhập đường dẫn như /, /etc, /data, /firmware rồi bấm Refresh hoặc Enter.
+- Double-click thư mục để mở, bấm Up để quay lên thư mục cha.
+- File/thư mục có icon nhận diện nhanh: thư mục, ảnh, video, text/log, database và file thường.
+- Có thể bấm tiêu đề cột Tên/Loại/Size/Sửa lúc để đổi sort nhanh.
+- Bấm Focus để ẩn phần phụ, chỉ giữ vùng file/thư mục lớn và thanh Up/đường dẫn/Thoát focus.
+- Chọn file thường rồi bấm Xem text để đọc tối đa 32768 bytes đầu tiên.
+- Chọn file thường rồi bấm Pull file về máy để tải về thư mục /home/bltn/BLTN_ADB/ecu-files.
+- Chọn file ảnh rồi bấm Xem ảnh, hoặc double-click file ảnh để mở ảnh trực tiếp qua ADB.
+- Chọn file video rồi bấm Mở video trực tiếp để stream qua ADB bằng mpv. App dùng URL local có hỗ trợ seek/range, không tải toàn bộ file trước.
+- Bấm Dừng video để đóng stream nếu cần.
+- Tab này chỉ đọc trên ECU. Không có nút xóa/sửa/push/chmod/remount để tránh làm hỏng build.
 
 Khi nào cần sửa thông số
 Nếu sau khi rút/cắm lại mà tên cổng thay đổi, sửa ô Tên cổng rồi bấm Cấu hình IP hoặc ADB Connect để lưu và dùng cấu hình mới.
@@ -205,6 +305,21 @@ def command_text(command):
     return " ".join(str(part) for part in command)
 
 
+def clean_command_output(text):
+    cleaned = ANSI_ESCAPE_PATTERN.sub("", text or "")
+    cleaned = cleaned.replace("\r", "\n")
+    lines = [line.rstrip() for line in cleaned.splitlines()]
+    compact = []
+    previous_blank = False
+    for line in lines:
+        blank = not line.strip()
+        if blank and previous_blank:
+            continue
+        compact.append(line)
+        previous_blank = blank
+    return "\n".join(compact).strip()
+
+
 def proc_cmdline(pid):
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as handle:
@@ -260,11 +375,17 @@ def read_process_records():
 
 
 def write_process_records(records):
-    os.makedirs(CACHE_DIR, exist_ok=True)
     temp_path = f"{PROCESS_FILE}.{os.getpid()}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as handle:
-        json.dump(records, handle, indent=2, sort_keys=True)
-    os.replace(temp_path, PROCESS_FILE)
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(records, handle, indent=2, sort_keys=True)
+        os.replace(temp_path, PROCESS_FILE)
+    except OSError:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
 
 
 def record_matches_process(record):
@@ -513,6 +634,8 @@ def run(command, timeout=2, purpose="command"):
         proc = subprocess.Popen(
             command,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=adb_env(),
@@ -539,6 +662,91 @@ def run(command, timeout=2, purpose="command"):
         return 124, f"{text}Command timeout: {command_text(command)}"
     except Exception as exc:
         return 1, str(exc)
+    finally:
+        if is_adb_command:
+            register_new_adb_servers(adb_servers_before)
+        if proc:
+            unregister_process(proc.pid)
+
+
+def run_with_input(command, input_text, timeout=10, purpose="command"):
+    is_adb_command = command_name(command) == "adb"
+    adb_servers_before = tracked_adb_server_pids() if is_adb_command else set()
+    proc = None
+    record = None
+    try:
+        proc = subprocess.Popen(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=adb_env(),
+            start_new_session=True,
+        )
+        record = register_process(proc.pid, command, purpose)
+        output, _stderr = proc.communicate(input=input_text, timeout=timeout)
+        return proc.returncode, clean_command_output(output)
+    except subprocess.TimeoutExpired:
+        if record:
+            kill_tracked_record(record)
+        elif proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            output, _stderr = proc.communicate(timeout=1)
+        except Exception:
+            output = ""
+        text = clean_command_output(output)
+        if text:
+            text += "\n"
+        return 124, f"{text}Command timeout: {command_text(command)}"
+    except Exception as exc:
+        return 1, str(exc)
+    finally:
+        if is_adb_command:
+            register_new_adb_servers(adb_servers_before)
+        if proc:
+            unregister_process(proc.pid)
+
+
+def run_binary(command, timeout=FILE_EXPLORER_TIMEOUT, purpose="command"):
+    is_adb_command = command_name(command) == "adb"
+    adb_servers_before = tracked_adb_server_pids() if is_adb_command else set()
+    proc = None
+    record = None
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=adb_env(),
+            start_new_session=True,
+        )
+        record = register_process(proc.pid, command, purpose)
+        output, stderr = proc.communicate(timeout=timeout)
+        if proc.returncode == 0:
+            return proc.returncode, output or b""
+        return proc.returncode, (stderr or output or b"")
+    except subprocess.TimeoutExpired:
+        if record:
+            kill_tracked_record(record)
+        elif proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            output, stderr = proc.communicate(timeout=1)
+        except Exception:
+            output, stderr = b"", b""
+        return 124, (stderr or output or b"") + b"\nCommand timeout"
+    except Exception as exc:
+        return 1, str(exc).encode("utf-8", errors="replace")
     finally:
         if is_adb_command:
             register_new_adb_servers(adb_servers_before)
@@ -603,11 +811,965 @@ def adb_connect_commands(config):
     ]
 
 
+def ensure_adb_device(config):
+    target = adb_target(config)
+    code, output = run(["adb", "devices"], timeout=2, purpose="file-explorer-state")
+    if code != 0:
+        return "", output or "Không chạy được adb devices."
+    return adb_state_from_devices(output, target), output
+
+
+def normalize_remote_path(path, base_path="/"):
+    text = str(path or "").strip()
+    if not text:
+        text = "/"
+    if not text.startswith("/"):
+        text = posixpath.join(base_path or "/", text)
+    normalized = posixpath.normpath(text)
+    return "/" if normalized in ("", ".") else normalized
+
+
+def remote_parent(path):
+    normalized = normalize_remote_path(path)
+    if normalized == "/":
+        return "/"
+    parent = posixpath.dirname(normalized.rstrip("/"))
+    return parent or "/"
+
+
+def remote_child_path(parent_path, child_name):
+    return normalize_remote_path(posixpath.join(parent_path, child_name))
+
+
+def quote_remote_path(path):
+    return shlex.quote(normalize_remote_path(path))
+
+
+def human_size(size):
+    try:
+        value = int(size)
+    except (TypeError, ValueError):
+        return str(size or "")
+    units = ("B", "KB", "MB", "GB")
+    current = float(value)
+    for unit in units:
+        if current < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(current)} {unit}"
+            return f"{current:.1f} {unit}"
+        current /= 1024
+    return f"{value} B"
+
+
+def remote_item_kind(permissions):
+    marker = permissions[0] if permissions else "-"
+    if marker == "d":
+        return "Thư mục"
+    if marker == "l":
+        return "Liên kết"
+    if marker == "c":
+        return "Char device"
+    if marker == "b":
+        return "Block device"
+    if marker == "s":
+        return "Socket"
+    if marker == "p":
+        return "Pipe"
+    return "File"
+
+
+def parse_ls_line(line, parent_path):
+    if not line or line.startswith("total "):
+        return None
+
+    parts = line.split(None, 7)
+    if len(parts) < 8:
+        return None
+
+    permissions = parts[0]
+    owner = parts[2]
+    group = parts[3]
+    size_text = parts[4]
+
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", parts[5]) and re.fullmatch(
+        r"\d{2}:\d{2}(?::\d{2})?", parts[6]
+    ):
+        modified = " ".join(parts[5:7])
+        name = parts[7]
+    else:
+        gnu_parts = line.split(None, 8)
+        if len(gnu_parts) < 9:
+            return None
+        modified = " ".join(gnu_parts[5:8])
+        name = gnu_parts[8]
+
+    path_name = name
+    link_target = ""
+    if permissions.startswith("l") and " -> " in name:
+        path_name, link_target = name.split(" -> ", 1)
+
+    if path_name in (".", ".."):
+        return None
+
+    try:
+        size_value = int(size_text)
+    except ValueError:
+        size_value = 0
+
+    full_path = remote_child_path(parent_path, path_name)
+    kind = remote_item_kind(permissions)
+    return {
+        "name": name,
+        "path_name": path_name,
+        "path": full_path,
+        "kind": kind,
+        "permissions": permissions,
+        "owner": owner,
+        "group": group,
+        "size": size_value,
+        "size_text": human_size(size_value),
+        "modified": modified,
+        "is_dir": permissions.startswith("d"),
+        "is_link": permissions.startswith("l"),
+        "link_target": link_target,
+    }
+
+
+def parse_ls_output(output, parent_path):
+    entries = []
+    for line in (output or "").splitlines():
+        item = parse_ls_line(line.rstrip(), parent_path)
+        if item:
+            entries.append(item)
+    entries.sort(key=lambda item: (not item["is_dir"], item["name"].lower()))
+    return entries
+
+
+def adb_shell(config, shell_command, timeout=FILE_EXPLORER_TIMEOUT, purpose="file-explorer"):
+    return run(
+        ["adb", "-s", adb_target(config), "shell", shell_command],
+        timeout=timeout,
+        purpose=purpose,
+    )
+
+
+def list_remote_dir(config, path):
+    normalized = normalize_remote_path(path)
+    state, devices_output = ensure_adb_device(config)
+    if state != "device":
+        return {
+            "ok": False,
+            "path": normalized,
+            "entries": [],
+            "message": (
+                f"ADB chưa sẵn sàng cho {adb_target(config)}. State: {state or 'not connected'}\n"
+                f"{devices_output}"
+            ).strip(),
+        }
+
+    command = f"LC_ALL=C ls -la {quote_remote_path(normalized)}"
+    code, output = adb_shell(config, command, timeout=FILE_EXPLORER_TIMEOUT)
+    if code != 0:
+        return {
+            "ok": False,
+            "path": normalized,
+            "entries": [],
+            "message": output or f"Không đọc được thư mục: {normalized}",
+        }
+
+    return {
+        "ok": True,
+        "path": normalized,
+        "entries": parse_ls_output(output, normalized),
+        "message": output,
+    }
+
+
+def read_remote_text_head(config, path, limit=REMOTE_PREVIEW_LIMIT):
+    normalized = normalize_remote_path(path)
+    command = (
+        f"if [ -f {quote_remote_path(normalized)} ]; then "
+        f"head -c {int(limit)} {quote_remote_path(normalized)}; "
+        "else echo 'Không phải file thường.'; exit 1; fi"
+    )
+    return adb_shell(config, command, timeout=FILE_EXPLORER_TIMEOUT, purpose="file-preview")
+
+
+def local_pull_path(remote_path):
+    root = os.path.join(adb_workdir(), "ecu-files")
+    normalized = normalize_remote_path(remote_path)
+    parts = [part for part in normalized.lstrip("/").split("/") if part and part not in (".", "..")]
+    if not parts:
+        parts = ["root"]
+    return os.path.join(root, *parts)
+
+
+def pull_remote_file(config, remote_path):
+    destination = local_pull_path(remote_path)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    code, output = run(
+        ["adb", "-s", adb_target(config), "pull", normalize_remote_path(remote_path), destination],
+        timeout=120,
+        purpose="file-pull",
+    )
+    if code == 0:
+        output = (output + "\n" if output else "") + f"Đã lưu: {destination}"
+    return code, output, destination
+
+
+def is_image_path(path):
+    lower = str(path or "").lower()
+    return any(lower.endswith(extension) for extension in IMAGE_EXTENSIONS)
+
+
+def read_remote_binary_file(config, remote_path, timeout=FILE_EXPLORER_TIMEOUT):
+    normalized = normalize_remote_path(remote_path)
+    command = [
+        "adb",
+        "-s",
+        adb_target(config),
+        "exec-out",
+        "sh",
+        "-c",
+        f"cat {quote_remote_path(normalized)}",
+    ]
+    return run_binary(command, timeout=timeout, purpose="file-binary-read")
+
+
+def read_remote_image(config, remote_path):
+    normalized = normalize_remote_path(remote_path)
+    if not is_image_path(normalized):
+        return {
+            "ok": False,
+            "path": normalized,
+            "data": b"",
+            "message": f"Không nhận diện là file ảnh: {normalized}",
+        }
+
+    state, devices_output = ensure_adb_device(config)
+    if state != "device":
+        return {
+            "ok": False,
+            "path": normalized,
+            "data": b"",
+            "message": (
+                f"ADB chưa sẵn sàng cho {adb_target(config)}. State: {state or 'not connected'}\n"
+                f"{devices_output}"
+            ).strip(),
+        }
+
+    size, size_error = remote_file_size(config, normalized)
+    if not size:
+        return {
+            "ok": False,
+            "path": normalized,
+            "data": b"",
+            "message": (
+                f"Không lấy được size hoặc file không còn tồn tại:\n{normalized}\n"
+                f"{size_error}"
+            ).strip(),
+        }
+    if size > IMAGE_PREVIEW_MAX_BYTES:
+        return {
+            "ok": False,
+            "path": normalized,
+            "data": b"",
+            "message": (
+                f"Ảnh quá lớn để preview trực tiếp: {human_size(size)}.\n"
+                "Dùng Pull file về máy nếu cần xem bằng trình xem ảnh ngoài."
+            ),
+        }
+
+    code, data = read_remote_binary_file(config, normalized, timeout=30)
+    if code != 0:
+        return {
+            "ok": False,
+            "path": normalized,
+            "data": b"",
+            "message": data.decode("utf-8", errors="replace") or f"Không đọc được ảnh: {normalized}",
+        }
+    return {
+        "ok": True,
+        "path": normalized,
+        "data": data,
+        "size": size,
+        "message": f"Đã đọc ảnh: {normalized}",
+    }
+
+
+def is_video_path(path):
+    lower = str(path or "").lower()
+    return any(lower.endswith(extension) for extension in VIDEO_EXTENSIONS)
+
+
+def is_text_path(path):
+    lower = str(path or "").lower()
+    return any(lower.endswith(extension) for extension in TEXT_EXTENSIONS)
+
+
+def is_database_path(path):
+    lower = str(path or "").lower()
+    return any(lower.endswith(extension) for extension in DATABASE_EXTENSIONS)
+
+
+def remote_item_display_name(item):
+    return item.get("path_name") or item.get("name") or posixpath.basename(item.get("path", ""))
+
+
+def remote_item_kind_label(item):
+    if item.get("is_dir"):
+        return "Thư mục"
+    if item.get("is_link"):
+        return "Liên kết"
+
+    kind = item.get("kind", "File")
+    path = item.get("path", "")
+    if kind != "File":
+        return kind
+    if is_image_path(path):
+        return "Ảnh"
+    if is_video_path(path):
+        return "Video"
+    if is_database_path(path):
+        return "Database"
+    if is_text_path(path):
+        return "Text/Log"
+    return "File"
+
+
+def remote_item_icon_name(item):
+    if item.get("is_dir"):
+        return "folder"
+    if item.get("is_link"):
+        return "emblem-symbolic-link"
+
+    kind = item.get("kind", "File")
+    path = item.get("path", "")
+    if kind in ("Char device", "Block device"):
+        return "drive-harddisk"
+    if kind == "Socket":
+        return "network-server"
+    if kind == "Pipe":
+        return "media-playback-pause"
+    if is_image_path(path):
+        return "image-x-generic"
+    if is_video_path(path):
+        return "video-x-generic"
+    if is_database_path(path):
+        return "x-office-spreadsheet"
+    if is_text_path(path):
+        return "text-x-generic"
+    return "application-octet-stream"
+
+
+def remote_item_grid_label(item):
+    name = remote_item_display_name(item)
+    if item.get("is_dir") or item.get("is_link"):
+        return name
+    size_text = item.get("size_text")
+    return f"{name}\n{size_text}" if size_text else name
+
+
+def modified_sort_value(modified):
+    text = str(modified or "").strip()
+    if not text:
+        return (1, "")
+
+    iso_match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}(?::\d{2})?)", text)
+    if iso_match:
+        date_text, time_text = iso_match.groups()
+        if len(time_text) == 5:
+            time_text = f"{time_text}:00"
+        return (0, f"{date_text} {time_text}")
+
+    current_year = time.localtime().tm_year
+    for fmt, inject_year in (("%b %d %H:%M", True), ("%b %d %Y", False)):
+        try:
+            parsed = time.strptime(text, fmt)
+        except ValueError:
+            continue
+        year = current_year if inject_year else parsed.tm_year
+        return (
+            0,
+            f"{year:04d}-{parsed.tm_mon:02d}-{parsed.tm_mday:02d} "
+            f"{parsed.tm_hour:02d}:{parsed.tm_min:02d}:00",
+        )
+
+    return (1, text.lower())
+
+
+def remote_entry_sort_key(item, sort_id):
+    name = remote_item_display_name(item).lower()
+    kind_label = remote_item_kind_label(item).lower()
+    if sort_id == "type":
+        return (kind_label, name)
+    if sort_id == "size":
+        return (int(item.get("size") or 0), name)
+    if sort_id == "modified":
+        return (modified_sort_value(item.get("modified")), name)
+    return (name,)
+
+
+def mpv_low_latency_command(remote_path, source="-"):
+    mpv_path = shutil.which("mpv")
+    if not mpv_path:
+        return None
+
+    title = f"ECU Video - {posixpath.basename(normalize_remote_path(remote_path))}"
+    return [
+        mpv_path,
+        "--force-window=yes",
+        "--profile=low-latency",
+        "--cache=no",
+        "--demuxer-readahead-secs=0.1",
+        f"--title={title}",
+        "--",
+        source,
+    ]
+
+
+def terminate_popen(proc, grace_seconds=0.5):
+    if not proc or proc.poll() is not None:
+        return False
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = proc.pid
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            return False
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        time.sleep(0.05)
+
+    if proc.poll() is None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    return True
+
+
+def remote_file_size(config, remote_path):
+    normalized = normalize_remote_path(remote_path)
+    quoted = quote_remote_path(normalized)
+    command = (
+        f"if [ -f {quoted} ]; then "
+        f"stat -c %s {quoted} 2>/dev/null || wc -c < {quoted}; "
+        "else echo '__MISSING_FILE__'; exit 1; fi"
+    )
+    code, output = adb_shell(config, command, timeout=FILE_EXPLORER_TIMEOUT, purpose="file-size")
+    if code != 0:
+        return None, output or f"Không lấy được size: {normalized}"
+
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    if not lines or not re.fullmatch(r"\d+", lines[0]):
+        return None, output or f"Không parse được size: {normalized}"
+    return int(lines[0]), ""
+
+
+def video_content_type(remote_path):
+    lower = str(remote_path or "").lower()
+    if lower.endswith((".mp4", ".m4v")):
+        return "video/mp4"
+    if lower.endswith(".mkv"):
+        return "video/x-matroska"
+    if lower.endswith(".webm"):
+        return "video/webm"
+    if lower.endswith(".ts"):
+        return "video/mp2t"
+    return "application/octet-stream"
+
+
+def parse_http_range(range_header, size):
+    if not range_header:
+        return 200, 0, max(size - 1, 0)
+
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+    if not match:
+        return 200, 0, max(size - 1, 0)
+
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        return 200, 0, max(size - 1, 0)
+
+    if not start_text:
+        suffix = int(end_text)
+        if suffix <= 0:
+            return 416, 0, 0
+        start = max(size - suffix, 0)
+        end = size - 1
+    else:
+        start = int(start_text)
+        end = int(end_text) if end_text else size - 1
+
+    if start >= size or start < 0:
+        return 416, 0, 0
+
+    end = min(end, size - 1)
+    if end < start:
+        return 416, 0, 0
+    return 206, start, end
+
+
+class AdbRangeVideoServer:
+    def __init__(self, config, remote_path, size):
+        self.config = dict(config)
+        self.remote_path = normalize_remote_path(remote_path)
+        self.size = int(size)
+        self.active_processes = set()
+        self.lock = threading.Lock()
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.make_handler())
+        self.httpd.daemon_threads = True
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        host, port = self.httpd.server_address
+        self.url = f"http://{host}:{port}/video"
+
+    def make_handler(self):
+        owner = self
+
+        class VideoRangeHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format, *_args):
+                return
+
+            def do_HEAD(self):
+                self.send_range_headers(send_body=False)
+
+            def do_GET(self):
+                self.send_range_headers(send_body=True)
+
+            def send_range_headers(self, send_body):
+                if self.path.split("?", 1)[0] != "/video":
+                    self.send_error(404)
+                    return
+
+                status, start, end = parse_http_range(self.headers.get("Range"), owner.size)
+                if status == 416:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{owner.size}")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    return
+
+                length = end - start + 1 if owner.size else 0
+                self.send_response(status)
+                self.send_header("Content-Type", video_content_type(owner.remote_path))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(length))
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{owner.size}")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                if send_body and length > 0:
+                    owner.stream_range(self.wfile, start, length)
+
+        return VideoRangeHandler
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        with self.lock:
+            processes = list(self.active_processes)
+        for proc in processes:
+            terminate_popen(proc)
+        try:
+            self.httpd.shutdown()
+        except Exception:
+            pass
+        try:
+            self.httpd.server_close()
+        except Exception:
+            pass
+
+    def stream_range(self, output, start, length):
+        command_text = (
+            f"tail -c +{int(start) + 1} {quote_remote_path(self.remote_path)} 2>/dev/null "
+            f"| head -c {int(length)}"
+        )
+        command = ["adb", "-s", adb_target(self.config), "exec-out", "sh", "-c", command_text]
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=adb_env(),
+                start_new_session=True,
+            )
+            register_process(proc.pid, command, "video-stream-range-adb")
+            with self.lock:
+                self.active_processes.add(proc)
+
+            remaining = int(length)
+            while remaining > 0:
+                chunk = proc.stdout.read(min(VIDEO_STREAM_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                output.write(chunk)
+                remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            if proc:
+                if proc.stdout:
+                    try:
+                        proc.stdout.close()
+                    except OSError:
+                        pass
+                terminate_popen(proc)
+                unregister_process(proc.pid)
+                with self.lock:
+                    self.active_processes.discard(proc)
+
+
+def start_remote_video_stream(config, remote_path):
+    normalized = normalize_remote_path(remote_path)
+    if not is_video_path(normalized):
+        return {
+            "ok": False,
+            "path": normalized,
+            "message": f"Không nhận diện là file video: {normalized}",
+            "processes": {},
+        }
+
+    if not shutil.which("mpv"):
+        return {
+            "ok": False,
+            "path": normalized,
+            "message": (
+                "Máy chưa có mpv nên chưa mở video trực tiếp được.\n"
+                "Cài bằng: sudo apt-get install -y mpv"
+            ),
+            "processes": {},
+        }
+
+    state, devices_output = ensure_adb_device(config)
+    if state != "device":
+        return {
+            "ok": False,
+            "path": normalized,
+            "message": (
+                f"ADB chưa sẵn sàng cho {adb_target(config)}. State: {state or 'not connected'}\n"
+                f"{devices_output}"
+            ).strip(),
+            "processes": {},
+        }
+
+    size, size_error = remote_file_size(config, normalized)
+    if not size:
+        return {
+            "ok": False,
+            "path": normalized,
+            "message": (
+                f"Không lấy được size hoặc file không còn tồn tại:\n{normalized}\n"
+                f"{size_error}"
+            ).strip(),
+            "processes": {},
+        }
+
+    cleanup_previous_processes(include_current=True, purpose_prefixes=("video-stream",))
+    range_server = None
+    mpv_proc = None
+    try:
+        range_server = AdbRangeVideoServer(config, normalized, size)
+        range_server.start()
+        mpv_command = mpv_low_latency_command(normalized, source=range_server.url)
+
+        mpv_proc = subprocess.Popen(
+            mpv_command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        register_process(mpv_proc.pid, mpv_command, "video-stream-mpv")
+
+        time.sleep(0.8)
+        if mpv_proc.poll() is not None:
+            range_server.stop()
+            cleanup_previous_processes(include_current=True, purpose_prefixes=("video-stream",))
+            return {
+                "ok": False,
+                "path": normalized,
+                "message": (
+                    "mpv đã thoát ngay sau khi mở stream range. File có thể lỗi, bị xóa, "
+                    "hoặc không đọc được qua ADB."
+                ),
+                "processes": {},
+            }
+
+    except Exception as exc:
+        if range_server:
+            range_server.stop()
+        cleanup_previous_processes(include_current=True, purpose_prefixes=("video-stream",))
+        return {
+            "ok": False,
+            "path": normalized,
+            "message": f"Không mở được video trực tiếp: {exc}",
+            "processes": {},
+        }
+
+    return {
+        "ok": True,
+        "path": normalized,
+        "message": (
+            f"Đang stream trực tiếp qua ADB:\n{normalized}\n\n"
+            f"Size: {human_size(size)}\n"
+            f"URL local có hỗ trợ seek/range: {range_server.url}\n"
+            "Backend chỉ đọc byte-range cần thiết từ ECU qua ADB, không tải toàn bộ file trước."
+        ),
+        "processes": {"player": mpv_proc},
+        "server": range_server,
+    }
+
+
 def append_command_output(outputs, label, code, output):
     if output:
         outputs.append(output)
     if code != 0:
         outputs.append(f"{label} lỗi ({code}).")
+
+
+def is_root_id_output(output):
+    return bool(re.search(r"\buid=0(?:\(|\b)", output or ""))
+
+
+def validate_debug_bin_path(path):
+    if not path:
+        return "Chưa chọn file debug .bin."
+    if not os.path.isfile(path):
+        return f"Không thấy file: {path}"
+    if not path.lower().endswith(".bin"):
+        return "File được chọn không phải .bin."
+    if os.path.getsize(path) <= 0:
+        return f"File rỗng: {path}"
+    return None
+
+
+def wait_for_adb_device(config, wait_seconds=10.0, log=None, purpose="adb-wait"):
+    target = adb_target(config)
+    deadline = time.monotonic() + wait_seconds
+    last_state = ""
+    last_devices = ""
+
+    while time.monotonic() < deadline:
+        code, devices = run(["adb", "devices"], timeout=2, purpose=f"{purpose}-state")
+        last_devices = clean_command_output(devices)
+        state = adb_state_from_devices(devices, target) if code == 0 else ""
+        if state != last_state and log:
+            log(f"ADB state: {state or 'chưa thấy thiết bị'}")
+        last_state = state
+        if state == "device":
+            return state, last_devices
+
+        if state == "offline":
+            run(["adb", "disconnect", target], timeout=2, purpose=f"{purpose}-disconnect")
+        run(["adb", "connect", target], timeout=4, purpose=f"{purpose}-connect")
+        time.sleep(1.0)
+
+    return last_state, last_devices
+
+
+def run_cmdtool_update_cpu(config, log=None):
+    target = adb_target(config)
+    last_code = 1
+    last_output = ""
+
+    for attempt in range(1, 3):
+        if attempt > 1:
+            if log:
+                log("ADB/cmdtool chưa ổn, thử connect lại rồi chạy update cpu lần nữa.")
+            state, devices = wait_for_adb_device(
+                config,
+                wait_seconds=10.0,
+                log=log,
+                purpose="get-root-cmdtool-retry",
+            )
+            if state != "device":
+                return False, last_code, (
+                    f"ADB chưa sẵn sàng để retry cmdtool. State: {state or 'not connected'}\n"
+                    f"{devices}"
+                ).strip()
+
+        code, output = run_with_input(
+            ["adb", "-s", target, "shell", "cmdtool"],
+            "update cpu\n",
+            timeout=20,
+            purpose="get-root-cmdtool",
+        )
+        output = clean_command_output(output)
+        last_code = code
+        last_output = output
+        if output and log:
+            log(output)
+
+        if "command status = 0" in output.lower():
+            if code == 124 and log:
+                log("cmdtool đã báo status=0 nhưng không tự thoát; app đã đóng phiên cmdtool.")
+            return True, code, output
+
+        transient = "offline" in output.lower() or "cannot connect to daemon" in output.lower()
+        if not transient:
+            break
+
+    return False, last_code, last_output
+
+
+def wait_for_root_after_reboot(config, log=None):
+    target = adb_target(config)
+    deadline = time.monotonic() + ROOT_WAIT_SECONDS
+    next_configure_at = 0.0
+    next_connect_at = 0.0
+    last_state = None
+    first_non_root_at = None
+    last_id_output = ""
+    last_devices = ""
+
+    if log:
+        log(f"Chờ thiết bị reboot và ADB lên lại tối đa {int(ROOT_WAIT_SECONDS)} giây...")
+
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+
+        if now >= next_configure_at:
+            for command in configure_ip_commands(config):
+                code, output = run(command, timeout=3, purpose="get-root-ip")
+                if code != 0 and output and log:
+                    log(f"Cấu hình IP chưa OK: {clean_command_output(output)}")
+                    break
+            next_configure_at = now + 5.0
+
+        if now >= next_connect_at:
+            code, output = run(["adb", "connect", target], timeout=4, purpose="get-root-connect")
+            if output and log and code == 0 and "already connected" not in output.lower():
+                log(clean_command_output(output))
+            next_connect_at = now + 2.0
+
+        code, devices = run(["adb", "devices"], timeout=2, purpose="get-root-state")
+        last_devices = devices
+        state = adb_state_from_devices(devices, target) if code == 0 else ""
+        if state != last_state:
+            if log:
+                log(f"ADB state: {state or 'chưa thấy thiết bị'}")
+            last_state = state
+
+        if state == "device":
+            code, id_output = run(
+                ["adb", "-s", target, "shell", "id"],
+                timeout=5,
+                purpose="get-root-id",
+            )
+            last_id_output = clean_command_output(id_output)
+            if last_id_output and log:
+                log(f"id: {last_id_output}")
+            if code == 0 and is_root_id_output(last_id_output):
+                return True, "Get Root thành công: thiết bị đang chạy với uid=0(root)."
+            if first_non_root_at is None:
+                first_non_root_at = now
+            elif now - first_non_root_at > 20:
+                return (
+                    False,
+                    "ADB đã lên lại nhưng chưa có root.\n"
+                    f"id cuối cùng: {last_id_output or 'không đọc được'}",
+                )
+
+        time.sleep(1.0)
+
+    message = "Hết thời gian chờ thiết bị lên lại sau Get Root."
+    if last_state:
+        message += f"\nADB state cuối: {last_state}"
+    if last_id_output:
+        message += f"\nid cuối: {last_id_output}"
+    if last_devices:
+        message += f"\nadb devices cuối:\n{last_devices}"
+    return False, message
+
+
+def get_root_with_debug_file(config, debug_path, log=None):
+    validation_error = validate_debug_bin_path(debug_path)
+    if validation_error:
+        return validation_error
+
+    target = adb_target(config)
+    debug_size = os.path.getsize(debug_path)
+
+    def emit(message):
+        if log:
+            log(message)
+
+    emit("Bắt đầu Get Root.")
+    emit(f"ADB target: {target}")
+    emit(f"File debug: {debug_path}")
+    emit(f"Size: {human_size(debug_size)}")
+
+    emit("Kiểm tra ADB:")
+    state, devices_output = wait_for_adb_device(
+        config,
+        wait_seconds=10.0,
+        log=emit,
+        purpose="get-root-precheck",
+    )
+    if devices_output:
+        emit(devices_output)
+    if state != "device":
+        return f"ADB chưa sẵn sàng. State: {state or 'not connected'}"
+
+    code, id_output = run(["adb", "-s", target, "shell", "id"], timeout=5, purpose="get-root-id-before")
+    id_output = clean_command_output(id_output)
+    if id_output:
+        emit(f"id trước khi chạy: {id_output}")
+    if code == 0 and is_root_id_output(id_output):
+        return "Thiết bị đã có root sẵn: uid=0(root). Không cần chạy update debug."
+
+    emit(f"Đẩy file debug vào thiết bị: {ROOT_UPDATE_REMOTE_PATH}")
+    code, output = run(
+        ["adb", "-s", target, "push", debug_path, ROOT_UPDATE_REMOTE_PATH],
+        timeout=30,
+        purpose="get-root-push-debug",
+    )
+    output = clean_command_output(output)
+    if output:
+        emit(output)
+    if code != 0:
+        return f"Push file debug lỗi ({code}).\n{output}"
+
+    emit("Chạy cmdtool: update cpu")
+    update_ok, code, output = run_cmdtool_update_cpu(config, log=emit)
+    if not update_ok:
+        return f"cmdtool update cpu chưa báo thành công ({code}).\n{output}"
+
+    emit("Chạy /home/adb/change_file để đổi quyền root và reboot.")
+    code, output = adb_shell(
+        config,
+        ROOT_CHANGE_FILE_COMMAND,
+        timeout=30,
+        purpose="get-root-change-file",
+    )
+    output = clean_command_output(output)
+    if output:
+        emit(output)
+    change_ok = "rebooting" in output.lower() or "setuid/setgid" in output.lower()
+    if code != 0 and not change_ok:
+        return f"change_file lỗi ({code}).\n{output}"
+
+    emit("Nếu change_file báo Rebooting, không cần reset tay; app đang chờ thiết bị tự lên lại.")
+    time.sleep(5)
+    ok, message = wait_for_root_after_reboot(config, log=emit)
+    return message if ok else f"Get Root chưa thành công.\n{message}"
 
 
 def adb_reconnect(config):
@@ -829,6 +1991,8 @@ def collect_status(config):
     adb_ok = False
     adb_state = ""
     adb_output = "Bỏ qua vì cổng chưa có IP."
+    root_ok = False
+    root_output = ""
     if exists and carrier == "1" and has_expected_ip:
         if tracked_adb_server_pids():
             _code, adb_output = run(["adb", "devices"], timeout=2, purpose="status")
@@ -837,12 +2001,23 @@ def collect_status(config):
         else:
             adb_output = "ADB server chưa chạy."
 
+    if adb_ok:
+        root_code, root_output = run(
+            ["adb", "-s", target, "shell", "id"],
+            timeout=2,
+            purpose="status-root",
+        )
+        root_output = clean_command_output(root_output)
+        root_ok = root_code == 0 and is_root_id_output(root_output)
+
     if not exists:
         banner = ("CHƯA THẤY ADAPTER", "bad")
     elif carrier != "1":
         banner = ("CHƯA CẮM / CHƯA CÓ LINK", "bad")
     elif not has_expected_ip:
         banner = (f"CÓ LINK, CHƯA CÓ IP {host_ip} - BẤM ADB CONNECT", "warn")
+    elif adb_ok and root_ok:
+        banner = ("CONNECTED - ADB ROOT READY", "ok")
     elif adb_ok:
         banner = ("CONNECTED - ADB READY", "ok")
     elif not ping_ok:
@@ -865,7 +2040,27 @@ def collect_status(config):
         "ADB port: không probe trực tiếp để tránh làm nhiễu adbd",
         f"ADB target: {target}",
         f"ADB status: {adb_state or ('device' if adb_ok else 'chưa kết nối')}",
-        f"Gợi ý: {'Bấm ADB Connect để app tự gán IP và canh ADB.' if not adb_ok else 'Có thể bấm Mở Terminal.'}",
+        (
+            "Root status: "
+            + (
+                "OK - uid=0(root)"
+                if root_ok
+                else "Chưa root"
+                if adb_ok
+                else "Bỏ qua vì ADB chưa device"
+            )
+        ),
+        f"id output: {root_output}" if adb_ok and root_output else None,
+        (
+            "Gợi ý: "
+            + (
+                "Bấm ADB Connect để app tự gán IP và canh ADB."
+                if not adb_ok
+                else "Đã có root, có thể bấm Mở Terminal hoặc dùng File Explorer."
+                if root_ok
+                else "Bấm Get Root để chọn file debug và lấy quyền root."
+            )
+        ),
         f"Cập nhật lúc: {time.strftime('%H:%M:%S')}",
     ]
     details = [line for line in details if line is not None]
@@ -878,6 +2073,8 @@ def collect_status(config):
         "adb_output": adb_output,
         "adb_ok": adb_ok,
         "adb_state": adb_state,
+        "root_ok": root_ok,
+        "root_output": root_output,
         "exists": exists,
         "carrier_ok": carrier == "1",
         "has_expected_ip": has_expected_ip,
@@ -892,15 +2089,31 @@ def collect_status(config):
 class AdapterStatus(Gtk.Window):
     def __init__(self):
         super().__init__(title="Network Adapter Status")
-        self.set_default_size(820, 640)
-        self.set_size_request(820, 640)
-        self.set_resizable(False)
+        self.set_default_size(1120, 760)
+        self.set_size_request(900, 640)
+        self.set_resizable(True)
         self.set_border_width(18)
         self.config = load_config()
         save_config(self.config)
         cleaned_processes = cleanup_previous_processes(purpose_prefixes=("terminal",))
         self.poll_running = False
         self.action_running = False
+        self.file_running = False
+        self.video_running = False
+        self.video_session_id = 0
+        self.selected_remote_item = None
+        self.remote_entries = []
+        self.file_icon_cache = {}
+        self.file_grid_icon_size = FILE_GRID_ICON_DEFAULT_SIZE
+        self.file_focus_mode = False
+        self.file_sort_id = "name"
+        self.file_sort_desc = False
+        self.file_dirs_first = True
+        self.syncing_file_selection = False
+        self.video_processes = {}
+        self.video_server = None
+        self.last_status = {}
+        self.connect("destroy", self.cleanup_video_on_destroy)
         self.last_action = (
             f"Đã dọn {len(cleaned_processes)} terminal cũ do app mở từ lần trước."
             if cleaned_processes
@@ -920,18 +2133,39 @@ class AdapterStatus(Gtk.Window):
             .warn { background: #92400e; color: #ffedd5; }
             .bad { background: #7f1d1d; color: #fee2e2; }
             .card { background: #1f2937; border-radius: 14px; padding: 14px; }
+            .file-focus-bar { background: #0f172a; border-radius: 8px; padding: 3px 6px; }
+            .file-focus-path { color: #cbd5e1; font-size: 12px; }
             textview, textview text { background: #1f2937; color: #e5e7eb; }
+            treeview { background: #111827; color: #e5e7eb; }
+            treeview.view:selected { background: #2563eb; color: #f8fafc; }
+            iconview { background: #111827; color: #e5e7eb; }
+            iconview.view:selected { background: #2563eb; color: #f8fafc; border-radius: 10px; }
+            notebook tab { padding: 8px 14px; }
             button { padding: 10px 14px; border-radius: 10px; }
+            button.compact-button { padding: 2px 8px; border-radius: 7px; }
             button.terminal-ready { background-image: none; background-color: #059669; color: #ecfdf5; font-weight: 700; }
             button.terminal-wait { color: #6b7280; }
+            button.root-needed { background-image: none; background-color: #b91c1c; color: #fef2f2; font-weight: 700; }
+            button.root-ok { background-image: none; background-color: #059669; color: #ecfdf5; font-weight: 700; }
+            button.root-wait { color: #6b7280; }
             """
         )
         Gtk.StyleContext.add_provider_for_screen(
             self.get_screen(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
+        window_root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(window_root)
+
+        self.notebook = Gtk.Notebook()
+        self.notebook.set_hexpand(True)
+        self.notebook.set_vexpand(True)
+        self.notebook.connect("switch-page", self.on_notebook_switch_page)
+        window_root.pack_start(self.notebook, True, True, 0)
+
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        self.add(root)
+        root.set_border_width(4)
+        self.notebook.append_page(root, Gtk.Label(label="Trạng thái ADB"))
 
         title = Gtk.Label(label="USB Network Adapter")
         title.set_xalign(0)
@@ -971,16 +2205,23 @@ class AdapterStatus(Gtk.Window):
         connect.connect("clicked", self.connect_adb)
         buttons.attach(connect, 1, 0, 1, 1)
 
+        self.get_root_button = Gtk.Button(label="Get Root")
+        self.get_root_button.set_sensitive(False)
+        self.get_root_button.get_style_context().add_class("root-wait")
+        self.get_root_button.set_tooltip_text("ADB chưa connect.")
+        self.get_root_button.connect("clicked", self.choose_debug_file_for_root)
+        buttons.attach(self.get_root_button, 2, 0, 1, 1)
+
         self.open_terminal_button = Gtk.Button(label="Mở Terminal")
         self.open_terminal_button.set_sensitive(False)
         self.open_terminal_button.get_style_context().add_class("terminal-wait")
         self.open_terminal_button.set_tooltip_text("ADB chưa connect.")
         self.open_terminal_button.connect("clicked", self.open_terminal)
-        buttons.attach(self.open_terminal_button, 2, 0, 1, 1)
+        buttons.attach(self.open_terminal_button, 3, 0, 1, 1)
 
         help_button = Gtk.Button(label="Help")
         help_button.connect("clicked", self.show_help)
-        buttons.attach(help_button, 3, 0, 1, 1)
+        buttons.attach(help_button, 4, 0, 1, 1)
 
         for child in buttons.get_children():
             child.set_hexpand(True)
@@ -990,7 +2231,13 @@ class AdapterStatus(Gtk.Window):
         if self.last_action:
             self.set_action_text(self.last_action)
 
+        self.file_explorer_page = self.build_file_explorer_page()
+        self.file_explorer_page_num = self.notebook.append_page(
+            self.file_explorer_page, Gtk.Label(label="File Explorer")
+        )
+
         GLib.timeout_add_seconds(1, self.refresh_async)
+        GLib.timeout_add_seconds(FILE_EXPLORER_AUTO_REFRESH_SECONDS, self.periodic_file_explorer_refresh)
 
     def add_entry(self, grid, column, row, label_text, value):
         label = Gtk.Label(label=label_text)
@@ -1006,6 +2253,424 @@ class AdapterStatus(Gtk.Window):
         grid.attach(entry, column * 2 + 1, row, 1, 1)
         return entry
 
+    def on_notebook_switch_page(self, _notebook, _page, page_num):
+        if page_num == getattr(self, "file_explorer_page_num", -1):
+            GLib.idle_add(self.auto_refresh_file_explorer)
+        return False
+
+    def adb_ready_for_file_refresh(self):
+        status = getattr(self, "last_status", {})
+        return bool(status.get("adb_ok") or status.get("adb_state") == "device")
+
+    def periodic_file_explorer_refresh(self):
+        if self.file_running or not self.adb_ready_for_file_refresh():
+            return True
+        if hasattr(self, "remote_path_entry") and self.remote_path_entry.has_focus():
+            return True
+
+        self.load_remote_dir(
+            getattr(self, "current_remote_path", "/"),
+            preserve_selection=True,
+            quiet=True,
+        )
+        return True
+
+    def auto_refresh_file_explorer(self):
+        if self.file_running:
+            return False
+
+        if self.adb_ready_for_file_refresh():
+            self.load_remote_dir(self.remote_path_entry.get_text() or self.current_remote_path)
+            return False
+
+        config = self.current_config()
+        self.set_file_info_text("Đang kiểm tra ADB để tự refresh File Explorer...")
+
+        def worker():
+            state, _devices_output = ensure_adb_device(config)
+            GLib.idle_add(self.finish_file_explorer_auto_refresh_check, state)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return False
+
+    def finish_file_explorer_auto_refresh_check(self, state):
+        if state == "device":
+            self.load_remote_dir(self.remote_path_entry.get_text() or self.current_remote_path)
+        else:
+            self.set_file_info_text(
+                f"ADB chưa ở trạng thái device nên chưa tự refresh File Explorer. State: {state or 'not connected'}"
+            )
+        return False
+
+    def build_file_explorer_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(4)
+
+        title = Gtk.Label(label="ADB File Explorer - chỉ đọc trên ECU")
+        title.set_xalign(0)
+        title.get_style_context().add_class("title")
+        page.pack_start(title, False, False, 0)
+        self.file_title = title
+
+        note = Gtk.Label(
+            label=(
+                "Duyệt file/thư mục qua ADB. App chỉ đọc trên ECU; Pull tải file về "
+                f"{os.path.join(adb_workdir(), 'ecu-files')}. Video được stream trực tiếp bằng mpv."
+            )
+        )
+        note.set_xalign(0)
+        note.get_style_context().add_class("subtitle")
+        constrain_label_width(note, max_width_chars=120)
+        page.pack_start(note, False, False, 0)
+        self.file_note = note
+
+        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        page.pack_start(nav, False, False, 0)
+        self.file_nav = nav
+
+        self.remote_path_entry = Gtk.Entry()
+        self.remote_path_entry.set_text("/")
+        self.remote_path_entry.set_hexpand(True)
+        self.remote_path_entry.connect("activate", self.browse_remote_path)
+        nav.pack_start(self.remote_path_entry, True, True, 0)
+
+        up_button = Gtk.Button(label="Up")
+        up_button.connect("clicked", self.go_remote_parent)
+        nav.pack_start(up_button, False, False, 0)
+
+        root_button = Gtk.Button(label="Root /")
+        root_button.connect("clicked", self.go_remote_root)
+        nav.pack_start(root_button, False, False, 0)
+
+        refresh_button = Gtk.Button(label="Refresh")
+        refresh_button.connect("clicked", self.browse_remote_path)
+        nav.pack_start(refresh_button, False, False, 0)
+
+        self.file_focus_toggle = Gtk.ToggleButton(label="Focus")
+        self.file_focus_toggle.set_tooltip_text("Ẩn phần phụ để vùng file/thư mục rộng hơn.")
+        self.file_focus_toggle.connect("toggled", self.on_file_focus_toggled)
+        nav.pack_start(self.file_focus_toggle, False, False, 0)
+
+        self.file_count_label = Gtk.Label(label="Chưa đọc thư mục.")
+        self.file_count_label.set_xalign(0)
+        self.file_count_label.get_style_context().add_class("subtitle")
+        page.pack_start(self.file_count_label, False, False, 0)
+
+        self.file_focus_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.file_focus_bar.get_style_context().add_class("file-focus-bar")
+        self.file_focus_bar.set_no_show_all(True)
+        page.pack_start(self.file_focus_bar, False, False, 0)
+
+        focus_up_button = Gtk.Button(label="↑")
+        focus_up_button.set_tooltip_text("Lên thư mục cha")
+        focus_up_button.get_style_context().add_class("compact-button")
+        focus_up_button.connect("clicked", self.go_remote_parent)
+        self.file_focus_bar.pack_start(focus_up_button, False, False, 0)
+
+        self.file_focus_path_label = Gtk.Label(label="/")
+        self.file_focus_path_label.set_xalign(0)
+        self.file_focus_path_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.file_focus_path_label.set_hexpand(True)
+        self.file_focus_path_label.get_style_context().add_class("file-focus-path")
+        self.file_focus_bar.pack_start(self.file_focus_path_label, True, True, 0)
+
+        self.file_focus_exit_button = Gtk.Button(label="Thoát")
+        self.file_focus_exit_button.set_tooltip_text("Thoát chế độ Focus")
+        self.file_focus_exit_button.get_style_context().add_class("compact-button")
+        self.file_focus_exit_button.connect("clicked", self.disable_file_focus)
+        self.file_focus_bar.pack_start(self.file_focus_exit_button, False, False, 0)
+
+        self.file_store = Gtk.ListStore(
+            GdkPixbuf.Pixbuf,
+            GdkPixbuf.Pixbuf,
+            str,
+            str,
+            str,
+            str,
+            str,
+            str,
+            str,
+            str,
+            bool,
+            int,
+            str,
+            str,
+            str,
+            str,
+        )
+        self.file_tree = Gtk.TreeView(model=self.file_store)
+        self.file_tree.set_headers_visible(True)
+        self.file_tree.set_search_column(FILE_COL_NAME)
+        self.file_tree.connect("row-activated", self.open_remote_row)
+        self.file_tree.get_selection().connect("changed", self.on_remote_selection_changed)
+
+        self.add_file_name_column(self.file_tree)
+        self.add_file_column(self.file_tree, "Loại", FILE_COL_KIND_LABEL, sort_id="type", width=110)
+        self.add_file_column(self.file_tree, "Size", FILE_COL_SIZE_TEXT, sort_id="size", width=90)
+        self.add_file_column(self.file_tree, "Quyền", FILE_COL_PERMISSIONS, width=110)
+        self.add_file_column(self.file_tree, "Owner/Group", FILE_COL_OWNER_GROUP, width=130)
+        self.add_file_column(self.file_tree, "Sửa lúc", FILE_COL_MODIFIED, sort_id="modified", width=150)
+
+        tree_scrolled = Gtk.ScrolledWindow()
+        tree_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        tree_scrolled.set_hexpand(True)
+        tree_scrolled.set_vexpand(True)
+        tree_scrolled.get_style_context().add_class("card")
+        tree_scrolled.add(self.file_tree)
+
+        self.file_grid = Gtk.IconView(model=self.file_store)
+        self.file_grid.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.file_grid.set_margin(12)
+        self.file_grid.set_spacing(12)
+        self.file_grid.set_row_spacing(16)
+        self.file_grid.set_column_spacing(18)
+        self.file_grid.connect("item-activated", self.open_remote_grid_item)
+        self.file_grid.connect("selection-changed", self.on_remote_grid_selection_changed)
+
+        grid_icon_renderer = Gtk.CellRendererPixbuf()
+        grid_icon_renderer.set_property("xalign", 0.5)
+        self.file_grid.pack_start(grid_icon_renderer, False)
+        self.file_grid.add_attribute(grid_icon_renderer, "pixbuf", FILE_COL_GRID_ICON)
+
+        self.file_grid_text_renderer = Gtk.CellRendererText()
+        self.file_grid_text_renderer.set_property("xalign", 0.5)
+        self.file_grid_text_renderer.set_property("wrap-mode", Pango.WrapMode.WORD_CHAR)
+        self.file_grid_text_renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+        self.file_grid.pack_start(self.file_grid_text_renderer, False)
+        self.file_grid.add_attribute(self.file_grid_text_renderer, "text", FILE_COL_GRID_LABEL)
+        self.update_file_grid_layout()
+
+        grid_scrolled = Gtk.ScrolledWindow()
+        grid_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        grid_scrolled.set_hexpand(True)
+        grid_scrolled.set_vexpand(True)
+        grid_scrolled.get_style_context().add_class("card")
+        grid_scrolled.add(self.file_grid)
+
+        self.file_stack = Gtk.Stack()
+        self.file_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.file_stack.set_transition_duration(120)
+        self.file_stack.set_hexpand(True)
+        self.file_stack.set_vexpand(True)
+        self.file_stack.add_named(tree_scrolled, "list")
+        self.file_stack.add_named(grid_scrolled, "grid")
+        self.file_stack.set_visible_child_name("list")
+        page.pack_start(self.file_stack, True, True, 0)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        page.pack_start(actions, False, False, 0)
+        self.file_actions = actions
+
+        open_button = Gtk.Button(label="Mở thư mục")
+        open_button.connect("clicked", self.open_selected_remote_item)
+        actions.pack_start(open_button, False, False, 0)
+        self.open_remote_button = open_button
+
+        self.preview_button = Gtk.Button(label="Xem text")
+        self.preview_button.connect("clicked", self.preview_selected_remote_file)
+        actions.pack_start(self.preview_button, False, False, 0)
+
+        self.pull_button = Gtk.Button(label="Pull file về máy")
+        self.pull_button.connect("clicked", self.pull_selected_remote_file)
+        actions.pack_start(self.pull_button, False, False, 0)
+
+        self.image_button = Gtk.Button(label="Xem ảnh")
+        self.image_button.connect("clicked", self.view_selected_remote_image)
+        actions.pack_start(self.image_button, False, False, 0)
+
+        self.video_button = Gtk.Button(label="Mở video trực tiếp")
+        self.video_button.connect("clicked", self.open_selected_remote_video)
+        actions.pack_start(self.video_button, False, False, 0)
+
+        self.stop_video_button = Gtk.Button(label="Dừng video")
+        self.stop_video_button.connect("clicked", self.stop_remote_video)
+        actions.pack_start(self.stop_video_button, False, False, 0)
+
+        self.copy_path_button = Gtk.Button(label="Copy path")
+        self.copy_path_button.connect("clicked", self.copy_selected_remote_path)
+        actions.pack_start(self.copy_path_button, False, False, 0)
+
+        self.file_info_panel, self.file_info_text = make_text_panel(150, monospace=True)
+        page.pack_start(self.file_info_panel, False, False, 0)
+        self.set_file_info_text(
+            "Bấm Refresh để đọc thư mục /. Double-click thư mục để mở.\n"
+            "Khi ADB đã connect, app tự refresh khi mở tab và tự đồng bộ mỗi "
+            f"{FILE_EXPLORER_AUTO_REFRESH_SECONDS} giây. Bấm Focus để xem file rộng hơn."
+        )
+        self.update_file_buttons()
+        self.current_remote_path = "/"
+        return page
+
+    def add_file_name_column(self, tree):
+        icon_renderer = Gtk.CellRendererPixbuf()
+        text_renderer = Gtk.CellRendererText()
+        text_renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+
+        column = Gtk.TreeViewColumn("Tên")
+        column.pack_start(icon_renderer, False)
+        column.add_attribute(icon_renderer, "pixbuf", FILE_COL_LIST_ICON)
+        column.pack_start(text_renderer, True)
+        column.add_attribute(text_renderer, "text", FILE_COL_NAME)
+        column.set_resizable(True)
+        column.set_expand(True)
+        column.set_min_width(330)
+        column.set_clickable(True)
+        column.connect("clicked", self.on_file_column_clicked, "name")
+        tree.append_column(column)
+
+    def add_file_column(self, tree, title, index, expand=False, width=None, sort_id=None):
+        renderer = Gtk.CellRendererText()
+        renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+        column = Gtk.TreeViewColumn(title, renderer, text=index)
+        column.set_resizable(True)
+        column.set_expand(expand)
+        if sort_id:
+            column.set_clickable(True)
+            column.connect("clicked", self.on_file_column_clicked, sort_id)
+        if width:
+            column.set_min_width(width)
+        tree.append_column(column)
+
+    def on_file_column_clicked(self, _column, sort_id):
+        if self.file_sort_id == sort_id:
+            self.file_sort_desc = not self.file_sort_desc
+        else:
+            self.file_sort_id = sort_id
+            self.file_sort_desc = False
+        self.refresh_file_store(preserve_selection=True)
+        return False
+
+    def load_icon_pixbuf(self, icon_name, size):
+        safe_name = icon_name or "application-octet-stream"
+        safe_size = max(16, int(size or FILE_LIST_ICON_SIZE))
+        cache_key = (safe_name, safe_size)
+        if cache_key in self.file_icon_cache:
+            return self.file_icon_cache[cache_key]
+
+        theme = Gtk.IconTheme.get_default()
+        for candidate in (safe_name, "text-x-generic", "application-octet-stream"):
+            try:
+                pixbuf = theme.load_icon(candidate, safe_size, Gtk.IconLookupFlags.FORCE_SIZE)
+                self.file_icon_cache[cache_key] = pixbuf
+                return pixbuf
+            except GLib.Error:
+                continue
+
+        self.file_icon_cache[cache_key] = None
+        return None
+
+    def sorted_remote_entries(self):
+        entries = list(getattr(self, "remote_entries", []))
+        sort_id = getattr(self, "file_sort_id", "name")
+        reverse = bool(getattr(self, "file_sort_desc", False))
+        dirs_first = bool(getattr(self, "file_dirs_first", True))
+
+        if dirs_first:
+            dirs = [item for item in entries if item.get("is_dir")]
+            rest = [item for item in entries if not item.get("is_dir")]
+            return (
+                sorted(dirs, key=lambda item: remote_entry_sort_key(item, sort_id), reverse=reverse)
+                + sorted(rest, key=lambda item: remote_entry_sort_key(item, sort_id), reverse=reverse)
+            )
+        return sorted(entries, key=lambda item: remote_entry_sort_key(item, sort_id), reverse=reverse)
+
+    def refresh_file_store(self, preserve_selection=False, selected_path=None, update_info=True):
+        if preserve_selection and not selected_path and self.selected_remote_item:
+            selected_path = self.selected_remote_item.get("path")
+
+        self.syncing_file_selection = True
+        try:
+            self.file_store.clear()
+            grid_icon_size = int(getattr(self, "file_grid_icon_size", FILE_GRID_ICON_DEFAULT_SIZE))
+            for item in self.sorted_remote_entries():
+                icon_name = remote_item_icon_name(item)
+                self.file_store.append(
+                    [
+                        self.load_icon_pixbuf(icon_name, FILE_LIST_ICON_SIZE),
+                        self.load_icon_pixbuf(icon_name, grid_icon_size),
+                        remote_item_display_name(item),
+                        remote_item_grid_label(item),
+                        remote_item_kind_label(item),
+                        item["size_text"],
+                        item["permissions"],
+                        f"{item['owner']}/{item['group']}",
+                        item["modified"],
+                        item["path"],
+                        item["is_dir"],
+                        int(item["size"]),
+                        item["group"],
+                        item["kind"],
+                        item.get("link_target", ""),
+                        icon_name,
+                    ]
+                )
+        finally:
+            self.syncing_file_selection = False
+
+        if selected_path:
+            restored_item = self.item_from_remote_path(selected_path)
+            if restored_item:
+                self.selected_remote_item = restored_item
+                if update_info:
+                    self.set_file_info_text(self.describe_remote_item(restored_item))
+                self.select_remote_path_in_views(selected_path)
+            else:
+                self.selected_remote_item = None
+                if update_info:
+                    self.set_file_info_text("Mục đã chọn không còn trong thư mục hiện tại.")
+            self.update_file_buttons()
+
+    def on_file_focus_toggled(self, toggle):
+        self.set_file_focus(toggle.get_active())
+        return False
+
+    def disable_file_focus(self, _button=None):
+        if hasattr(self, "file_focus_toggle") and self.file_focus_toggle.get_active():
+            self.file_focus_toggle.set_active(False)
+        else:
+            self.set_file_focus(False)
+        return False
+
+    def set_file_focus(self, enabled):
+        self.file_focus_mode = bool(enabled)
+        hidden_widgets = [
+            getattr(self, "file_title", None),
+            getattr(self, "file_note", None),
+            getattr(self, "file_nav", None),
+            getattr(self, "file_count_label", None),
+            getattr(self, "file_actions", None),
+            getattr(self, "file_info_panel", None),
+        ]
+
+        if self.file_focus_mode:
+            for widget in hidden_widgets:
+                if widget:
+                    widget.hide()
+            self.update_file_focus_path()
+            self.file_focus_bar.set_no_show_all(False)
+            self.file_focus_bar.show_all()
+        else:
+            self.file_focus_bar.hide()
+            self.file_focus_bar.set_no_show_all(True)
+            for widget in hidden_widgets:
+                if widget:
+                    widget.show_all()
+
+        return False
+
+    def update_file_focus_path(self):
+        if hasattr(self, "file_focus_path_label"):
+            self.file_focus_path_label.set_text(getattr(self, "current_remote_path", "/"))
+        return False
+
+    def update_file_grid_layout(self):
+        size = int(getattr(self, "file_grid_icon_size", FILE_GRID_ICON_DEFAULT_SIZE))
+        item_width = max(116, size + 74)
+        self.file_grid.set_item_width(item_width)
+        if hasattr(self, "file_grid_text_renderer"):
+            self.file_grid_text_renderer.set_property("wrap-width", max(96, item_width - 16))
+            self.file_grid_text_renderer.set_property("width", max(96, item_width - 16))
+
     def current_config(self):
         config = {
             "iface": sanitize_iface(self.iface_entry.get_text()),
@@ -1020,6 +2685,555 @@ class AdapterStatus(Gtk.Window):
 
     def set_details_text(self, text):
         set_text_view(self.details_text, text)
+
+    def set_file_info_text(self, text):
+        set_text_view(self.file_info_text, text)
+
+    def update_file_buttons(self):
+        item = self.selected_remote_item
+        has_item = item is not None
+        is_directory_like = has_item and (item.get("is_dir") or item.get("kind") == "Liên kết")
+        is_regular_file = has_item and item.get("kind") == "File"
+        is_image_file = is_regular_file and is_image_path(item.get("path", ""))
+        is_video_file = is_regular_file and is_video_path(item.get("path", ""))
+
+        if hasattr(self, "open_remote_button"):
+            self.open_remote_button.set_sensitive(bool(is_directory_like) and not self.file_running)
+        if hasattr(self, "preview_button"):
+            self.preview_button.set_sensitive(bool(is_regular_file) and not self.file_running)
+        if hasattr(self, "pull_button"):
+            self.pull_button.set_sensitive(bool(is_regular_file) and not self.file_running)
+        if hasattr(self, "image_button"):
+            self.image_button.set_sensitive(bool(is_image_file) and not self.file_running)
+        if hasattr(self, "video_button"):
+            self.video_button.set_sensitive(bool(is_video_file) and not self.file_running)
+        if hasattr(self, "stop_video_button"):
+            self.stop_video_button.set_sensitive(self.video_running)
+        if hasattr(self, "copy_path_button"):
+            self.copy_path_button.set_sensitive(has_item)
+
+    def selected_item_from_row(self, row):
+        return {
+            "name": row[FILE_COL_NAME],
+            "kind_label": row[FILE_COL_KIND_LABEL],
+            "kind": row[FILE_COL_KIND],
+            "size_text": row[FILE_COL_SIZE_TEXT],
+            "permissions": row[FILE_COL_PERMISSIONS],
+            "owner_group": row[FILE_COL_OWNER_GROUP],
+            "modified": row[FILE_COL_MODIFIED],
+            "path": row[FILE_COL_PATH],
+            "is_dir": bool(row[FILE_COL_IS_DIR]),
+            "size": int(row[FILE_COL_SIZE]),
+            "group": row[FILE_COL_GROUP],
+            "link_target": row[FILE_COL_LINK_TARGET],
+            "icon_name": row[FILE_COL_ICON_NAME],
+        }
+
+    def describe_remote_item(self, item):
+        if not item:
+            return "Chưa chọn file/thư mục."
+        link_line = f"Link tới: {item['link_target']}" if item.get("link_target") else None
+        lines = [
+            f"Path: {item['path']}",
+            f"Tên: {item['name']}",
+            f"Loại: {item.get('kind_label') or item['kind']}",
+            f"Size: {item['size_text']}",
+            f"Quyền: {item['permissions']}",
+            f"Owner/Group: {item['owner_group']}",
+            f"Sửa lúc: {item['modified']}",
+        ]
+        if link_line:
+            lines.append(link_line)
+        lines.extend(
+            [
+                "",
+                (
+                    "Đây là file ảnh: có thể bấm Xem ảnh hoặc double-click để mở."
+                    if item.get("kind") == "File" and is_image_path(item["path"])
+                    else
+                    "Đây là file video: có thể bấm Mở video trực tiếp."
+                    if item.get("kind") == "File" and is_video_path(item["path"])
+                    else "Double-click thư mục để mở. File thường có thể Xem text hoặc Pull về máy."
+                ),
+            ]
+        )
+        return "\n".join(
+            lines
+        )
+
+    def browse_remote_path(self, _widget=None):
+        path = self.remote_path_entry.get_text()
+        self.load_remote_dir(path)
+
+    def go_remote_parent(self, _button):
+        self.load_remote_dir(remote_parent(getattr(self, "current_remote_path", "/")))
+
+    def go_remote_root(self, _button):
+        self.load_remote_dir("/")
+
+    def load_remote_dir(self, path, preserve_selection=False, quiet=False):
+        if self.file_running:
+            if not quiet:
+                self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        if quiet:
+            config = self.current_config()
+        else:
+            self.store_current_config()
+            config = dict(self.config)
+        base_path = getattr(self, "current_remote_path", "/")
+        normalized = normalize_remote_path(path, base_path)
+        selected_path = (
+            self.selected_remote_item.get("path")
+            if preserve_selection and self.selected_remote_item
+            else None
+        )
+        self.remote_path_entry.set_text(normalized)
+        if hasattr(self, "file_focus_path_label"):
+            self.file_focus_path_label.set_text(normalized)
+        self.file_running = True
+        if not preserve_selection:
+            self.selected_remote_item = None
+        self.update_file_buttons()
+        self.file_count_label.set_text(
+            f"Đang tự đồng bộ: {normalized}" if quiet else f"Đang đọc: {normalized}"
+        )
+        if not quiet:
+            self.set_file_info_text(f"Đang đọc thư mục qua ADB: {normalized}")
+
+        def worker():
+            result = list_remote_dir(config, normalized)
+            result["preserve_selection"] = bool(preserve_selection)
+            result["selected_path"] = selected_path
+            result["quiet"] = bool(quiet)
+            GLib.idle_add(self.apply_remote_dir, result)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def apply_remote_dir(self, result):
+        self.file_running = False
+        quiet = bool(result.get("quiet"))
+        preserve_selection = bool(result.get("preserve_selection"))
+        selected_path = result.get("selected_path")
+
+        if not result.get("ok"):
+            if quiet:
+                current_path = getattr(self, "current_remote_path", result.get("path", "/"))
+                self.file_count_label.set_text(
+                    f"{current_path}: tự đồng bộ lỗi lúc {time.strftime('%H:%M:%S')}"
+                )
+                if not getattr(self, "remote_entries", []):
+                    self.set_file_info_text(result.get("message", "Không đọc được thư mục."))
+            else:
+                self.file_store.clear()
+                self.selected_remote_item = None
+                self.remote_entries = []
+                self.file_count_label.set_text(f"Không đọc được: {result.get('path', '/')}")
+                self.set_file_info_text(result.get("message", "Không đọc được thư mục."))
+            self.update_file_buttons()
+            return False
+
+        if not preserve_selection:
+            self.selected_remote_item = None
+        self.current_remote_path = result["path"]
+        self.remote_path_entry.set_text(self.current_remote_path)
+        self.update_file_focus_path()
+        entries = result.get("entries", [])
+        self.remote_entries = entries
+        self.refresh_file_store(
+            preserve_selection=preserve_selection,
+            selected_path=selected_path,
+            update_info=not quiet,
+        )
+
+        self.file_count_label.set_text(
+            f"{self.current_remote_path}: {len(entries)} mục - cập nhật {time.strftime('%H:%M:%S')}"
+        )
+        if not quiet:
+            self.set_file_info_text(
+                "Đã đọc thư mục. Chọn một dòng để xem thông tin, double-click thư mục để mở."
+                if entries
+                else "Thư mục trống hoặc không có mục đọc được."
+            )
+        self.update_file_buttons()
+        return False
+
+    def on_remote_selection_changed(self, selection):
+        if self.syncing_file_selection:
+            return False
+
+        model, tree_iter = selection.get_selected()
+        if tree_iter is None:
+            self.apply_remote_selection(None, sync_views=False)
+        else:
+            self.apply_remote_selection(self.selected_item_from_row(model[tree_iter]), sync_views=True)
+        return False
+
+    def open_remote_row(self, tree, path, _column):
+        model = tree.get_model()
+        item = self.selected_item_from_model_path(model, path)
+        self.open_remote_item(item)
+        return False
+
+    def on_remote_grid_selection_changed(self, icon_view):
+        if self.syncing_file_selection:
+            return False
+
+        paths = icon_view.get_selected_items()
+        if not paths:
+            self.apply_remote_selection(None, sync_views=False)
+            return False
+
+        item = self.selected_item_from_model_path(icon_view.get_model(), paths[0])
+        self.apply_remote_selection(item, sync_views=True)
+        return False
+
+    def open_remote_grid_item(self, icon_view, path):
+        item = self.selected_item_from_model_path(icon_view.get_model(), path)
+        self.open_remote_item(item)
+        return False
+
+    def item_from_remote_path(self, remote_path):
+        tree_iter = self.file_store.get_iter_first()
+        while tree_iter is not None:
+            if self.file_store[tree_iter][FILE_COL_PATH] == remote_path:
+                return self.selected_item_from_row(self.file_store[tree_iter])
+            tree_iter = self.file_store.iter_next(tree_iter)
+        return None
+
+    def selected_item_from_model_path(self, model, path):
+        try:
+            tree_iter = model.get_iter(path)
+        except (TypeError, ValueError):
+            return None
+        return self.selected_item_from_row(model[tree_iter])
+
+    def apply_remote_selection(self, item, sync_views=True):
+        self.selected_remote_item = item
+        if item is None:
+            self.set_file_info_text("Chưa chọn file/thư mục.")
+        else:
+            self.set_file_info_text(self.describe_remote_item(item))
+            if sync_views:
+                self.select_remote_path_in_views(item.get("path"))
+        self.update_file_buttons()
+
+    def select_remote_path_in_views(self, remote_path):
+        if not remote_path:
+            return False
+
+        tree_iter = self.file_store.get_iter_first()
+        while tree_iter is not None:
+            if self.file_store[tree_iter][FILE_COL_PATH] == remote_path:
+                tree_path = self.file_store.get_path(tree_iter)
+                self.syncing_file_selection = True
+                try:
+                    self.file_tree.get_selection().select_path(tree_path)
+                    self.file_tree.scroll_to_cell(tree_path, None, False, 0.0, 0.0)
+                    self.file_grid.unselect_all()
+                    self.file_grid.select_path(tree_path)
+                    self.file_grid.scroll_to_path(tree_path, False, 0.0, 0.0)
+                finally:
+                    self.syncing_file_selection = False
+                return True
+            tree_iter = self.file_store.iter_next(tree_iter)
+        return False
+
+    def open_remote_item(self, item):
+        if not item:
+            return False
+        if item.get("is_dir") or item.get("kind") == "Liên kết":
+            self.load_remote_dir(item["path"])
+        elif item.get("kind") == "File" and is_image_path(item.get("path", "")):
+            self.selected_remote_item = item
+            self.view_selected_remote_image(None)
+        elif item.get("kind") == "File" and is_video_path(item.get("path", "")):
+            self.selected_remote_item = item
+            self.open_selected_remote_video(None)
+        return False
+
+    def open_selected_remote_item(self, _button):
+        item = self.selected_remote_item
+        if item and (item.get("is_dir") or item.get("kind") == "Liên kết"):
+            self.load_remote_dir(item["path"])
+
+    def preview_selected_remote_file(self, _button):
+        item = self.selected_remote_item
+        if not item or item.get("kind") != "File":
+            self.set_file_info_text("Chỉ preview file thường.")
+            return False
+        if self.file_running:
+            self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        self.store_current_config()
+        self.file_running = True
+        self.update_file_buttons()
+        self.set_file_info_text(f"Đang đọc tối đa {REMOTE_PREVIEW_LIMIT} bytes: {item['path']}")
+        config = dict(self.config)
+        remote_path = item["path"]
+
+        def worker():
+            code, output = read_remote_text_head(config, remote_path)
+            if code == 0:
+                message = (
+                    f"Preview: {remote_path}\n"
+                    f"Giới hạn: {REMOTE_PREVIEW_LIMIT} bytes đầu tiên\n"
+                    "----------------------------------------\n"
+                    f"{output}"
+                )
+            else:
+                message = f"Không preview được: {remote_path}\n{output}"
+            GLib.idle_add(self.finish_file_operation, message)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def pull_selected_remote_file(self, _button):
+        item = self.selected_remote_item
+        if not item or item.get("kind") != "File":
+            self.set_file_info_text("Chỉ pull file thường ở giai đoạn này.")
+            return False
+        if self.file_running:
+            self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        self.store_current_config()
+        self.file_running = True
+        self.update_file_buttons()
+        self.set_file_info_text(f"Đang pull file về máy: {item['path']}")
+        config = dict(self.config)
+        remote_path = item["path"]
+
+        def worker():
+            code, output, destination = pull_remote_file(config, remote_path)
+            if code == 0:
+                message = output
+            else:
+                message = f"Pull lỗi ({code}): {remote_path}\nĐích local: {destination}\n{output}"
+            GLib.idle_add(self.finish_file_operation, message)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def view_selected_remote_image(self, _button):
+        item = self.selected_remote_item
+        if not item or item.get("kind") != "File" or not is_image_path(item.get("path", "")):
+            self.set_file_info_text("Chỉ xem trực tiếp file ảnh được nhận diện theo đuôi file.")
+            return False
+        if self.file_running:
+            self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        self.store_current_config()
+        self.file_running = True
+        self.update_file_buttons()
+        self.set_file_info_text(f"Đang đọc ảnh qua ADB:\n{item['path']}")
+        config = dict(self.config)
+        remote_path = item["path"]
+
+        def worker():
+            result = read_remote_image(config, remote_path)
+            GLib.idle_add(self.finish_remote_image_read, result)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def finish_remote_image_read(self, result):
+        self.file_running = False
+        if not result.get("ok"):
+            self.set_file_info_text(result.get("message", "Không đọc được ảnh."))
+            self.update_file_buttons()
+            return False
+
+        try:
+            pixbuf = self.pixbuf_from_image_data(result.get("data", b""))
+        except Exception as exc:
+            self.set_file_info_text(f"Không decode được ảnh:\n{result.get('path', '')}\n{exc}")
+            self.update_file_buttons()
+            return False
+
+        self.show_image_window(result["path"], pixbuf, result.get("size", len(result.get("data", b""))))
+        self.set_file_info_text(
+            f"Đã mở ảnh:\n{result['path']}\n"
+            f"Kích thước file: {human_size(result.get('size', 0))}\n"
+            f"Độ phân giải: {pixbuf.get_width()}x{pixbuf.get_height()}"
+        )
+        self.update_file_buttons()
+        return False
+
+    def pixbuf_from_image_data(self, data):
+        loader = GdkPixbuf.PixbufLoader()
+        loader.write(data)
+        loader.close()
+        pixbuf = loader.get_pixbuf()
+        if not pixbuf:
+            raise ValueError("GdkPixbuf không đọc được dữ liệu ảnh.")
+        return pixbuf
+
+    def scaled_image_pixbuf(self, pixbuf):
+        width = pixbuf.get_width()
+        height = pixbuf.get_height()
+        if width <= IMAGE_PREVIEW_MAX_WIDTH and height <= IMAGE_PREVIEW_MAX_HEIGHT:
+            return pixbuf
+
+        scale = min(IMAGE_PREVIEW_MAX_WIDTH / width, IMAGE_PREVIEW_MAX_HEIGHT / height)
+        scaled_width = max(1, int(width * scale))
+        scaled_height = max(1, int(height * scale))
+        return pixbuf.scale_simple(scaled_width, scaled_height, GdkPixbuf.InterpType.BILINEAR)
+
+    def show_image_window(self, remote_path, pixbuf, size):
+        display_pixbuf = self.scaled_image_pixbuf(pixbuf)
+        dialog = Gtk.Window(title=f"Xem ảnh - {posixpath.basename(normalize_remote_path(remote_path))}")
+        dialog.set_transient_for(self)
+        dialog.set_default_size(980, 720)
+        dialog.set_border_width(12)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        dialog.add(root)
+
+        title = Gtk.Label(label=posixpath.basename(normalize_remote_path(remote_path)))
+        title.set_xalign(0)
+        title.get_style_context().add_class("title")
+        root.pack_start(title, False, False, 0)
+
+        details = Gtk.Label(
+            label=(
+                f"Path: {normalize_remote_path(remote_path)}\n"
+                f"File: {human_size(size)} | Ảnh gốc: {pixbuf.get_width()}x{pixbuf.get_height()} | "
+                f"Hiển thị: {display_pixbuf.get_width()}x{display_pixbuf.get_height()}"
+            )
+        )
+        details.set_xalign(0)
+        details.get_style_context().add_class("subtitle")
+        constrain_label_width(details, max_width_chars=140)
+        root.pack_start(details, False, False, 0)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_hexpand(True)
+        scrolled.set_vexpand(True)
+        scrolled.get_style_context().add_class("card")
+        root.pack_start(scrolled, True, True, 0)
+
+        image = Gtk.Image.new_from_pixbuf(display_pixbuf)
+        image.set_halign(Gtk.Align.CENTER)
+        image.set_valign(Gtk.Align.CENTER)
+        scrolled.add(image)
+
+        close_button = Gtk.Button(label="Đóng")
+        close_button.connect("clicked", lambda _button: dialog.destroy())
+        root.pack_start(close_button, False, False, 0)
+
+        dialog.show_all()
+
+    def open_selected_remote_video(self, _button):
+        item = self.selected_remote_item
+        if not item or item.get("kind") != "File" or not is_video_path(item.get("path", "")):
+            self.set_file_info_text("Chỉ mở trực tiếp file video được nhận diện theo đuôi file.")
+            return False
+        if self.file_running:
+            self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        self.store_current_config()
+        self.file_running = True
+        self.video_running = False
+        self.video_session_id += 1
+        session_id = self.video_session_id
+        self.update_file_buttons()
+        self.set_file_info_text(f"Đang mở video trực tiếp qua ADB:\n{item['path']}")
+        config = dict(self.config)
+        remote_path = item["path"]
+
+        def worker():
+            result = start_remote_video_stream(config, remote_path)
+            GLib.idle_add(self.finish_video_start, result, session_id)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def finish_video_start(self, result, session_id):
+        if session_id != self.video_session_id:
+            return False
+
+        self.file_running = False
+        if result.get("ok"):
+            self.video_running = True
+            self.video_processes = result.get("processes", {})
+            self.video_server = result.get("server")
+            self.set_file_info_text(result.get("message", "Đã mở video trực tiếp."))
+            threading.Thread(
+                target=self.watch_video_stream,
+                args=(session_id, self.video_processes, self.video_server, result.get("path", "")),
+                daemon=True,
+            ).start()
+        else:
+            self.video_running = False
+            self.video_processes = {}
+            self.video_server = None
+            self.set_file_info_text(result.get("message", "Không mở được video trực tiếp."))
+
+        self.update_file_buttons()
+        return False
+
+    def watch_video_stream(self, session_id, processes, video_server, remote_path):
+        player_proc = processes.get("player")
+        if player_proc:
+            try:
+                player_proc.wait()
+            except Exception:
+                pass
+
+        if video_server:
+            video_server.stop()
+
+        GLib.idle_add(self.finish_video_stream, session_id, remote_path)
+
+    def finish_video_stream(self, session_id, remote_path):
+        if session_id != self.video_session_id:
+            return False
+        self.video_running = False
+        self.video_processes = {}
+        self.video_server = None
+        self.update_file_buttons()
+        self.set_file_info_text(f"Video đã đóng hoặc stream đã dừng:\n{remote_path}")
+        return False
+
+    def stop_remote_video(self, _button=None):
+        killed = cleanup_previous_processes(include_current=True, purpose_prefixes=("video-stream",))
+        if self.video_server:
+            self.video_server.stop()
+        for proc in self.video_processes.values():
+            terminate_popen(proc)
+        self.video_running = False
+        self.video_processes = {}
+        self.video_server = None
+        self.video_session_id += 1
+        self.update_file_buttons()
+        message = f"Đã dừng {len(killed)} tiến trình video stream." if killed else "Không có video stream đang chạy."
+        self.set_file_info_text(message)
+        return False
+
+    def cleanup_video_on_destroy(self, _window):
+        if self.video_running or self.video_processes:
+            self.stop_remote_video()
+
+    def copy_selected_remote_path(self, _button):
+        item = self.selected_remote_item
+        path = item["path"] if item else self.remote_path_entry.get_text()
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(path, -1)
+        clipboard.store()
+        self.set_file_info_text(f"Đã copy path:\n{path}")
+
+    def finish_file_operation(self, message):
+        self.file_running = False
+        self.set_file_info_text(message)
+        self.update_file_buttons()
+        return False
 
     def store_current_config(self):
         self.config = self.current_config()
@@ -1047,6 +3261,92 @@ class AdapterStatus(Gtk.Window):
     def connect_adb(self, _button):
         self.store_current_config()
         self.run_adb_reconnect(self.config)
+
+    def choose_debug_file_for_root(self, _button):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+        if self.file_running or self.video_running:
+            self.set_action_text("Đang có thao tác file/video chạy. Dừng thao tác đó trước khi Get Root.")
+            return False
+        if not self.adb_ready_for_file_refresh():
+            self.set_action_text("ADB chưa ở trạng thái device nên chưa thể Get Root.")
+            return False
+        if self.last_status.get("root_ok"):
+            root_output = self.last_status.get("root_output") or "uid=0(root)"
+            self.set_action_text(f"Thiết bị đã có quyền root.\n{root_output}")
+            return False
+
+        dialog = Gtk.FileChooserDialog(
+            title="Chọn file debug .bin để Get Root",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.set_modal(True)
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            "Chọn file",
+            Gtk.ResponseType.OK,
+        )
+        dialog.set_current_folder(adb_workdir())
+
+        debug_filter = Gtk.FileFilter()
+        debug_filter.set_name("Debug bin (*.bin)")
+        debug_filter.add_pattern("*.bin")
+        debug_filter.add_pattern("*.BIN")
+        dialog.add_filter(debug_filter)
+
+        all_filter = Gtk.FileFilter()
+        all_filter.set_name("Tất cả file")
+        all_filter.add_pattern("*")
+        dialog.add_filter(all_filter)
+
+        response = dialog.run()
+        debug_path = dialog.get_filename() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        if not debug_path:
+            return False
+
+        self.store_current_config()
+        return self.run_get_root(self.config, debug_path)
+
+    def run_get_root(self, config, debug_path):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        validation_error = validate_debug_bin_path(debug_path)
+        if validation_error:
+            self.set_action_text(validation_error)
+            return False
+
+        self.action_running = True
+        self.set_banner("ĐANG GET ROOT...", "warn")
+        self.set_get_root_button_ready(False, False)
+        self.set_terminal_button_ready(False)
+
+        log_lines = []
+
+        def append_log(message):
+            text = clean_command_output(str(message or ""))
+            if not text:
+                return
+            log_lines.append(f"[{time.strftime('%H:%M:%S')}] {text}")
+            GLib.idle_add(self.set_action_text, "\n".join(log_lines))
+
+        append_log("Đang chuẩn bị quy trình Get Root...")
+
+        def worker():
+            try:
+                result = get_root_with_debug_file(config, debug_path, log=append_log)
+            except Exception as exc:
+                result = f"Lỗi không xử lý khi Get Root: {exc}"
+            append_log(f"Kết quả: {result}")
+            GLib.idle_add(self.finish_action, "\n".join(log_lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
 
     def reset_all(self, _button=None):
         self.store_current_config()
@@ -1201,16 +3501,54 @@ class AdapterStatus(Gtk.Window):
 
     def apply_status(self, status):
         self.poll_running = False
+        self.last_status = dict(status)
         self.set_banner(status["banner_text"], status["banner_state"])
         self.set_terminal_button_ready(status.get("adb_ok", False))
+        self.set_get_root_button_ready(status.get("adb_ok", False), status.get("root_ok", False))
 
         self.set_details_text(status["details"])
         return False
 
+    def set_get_root_button_ready(self, adb_ready, root_ok=False):
+        if not hasattr(self, "get_root_button"):
+            return
+        blocked_by_action = self.action_running
+        adb_ready = bool(adb_ready)
+        root_ok = bool(root_ok) and adb_ready
+        ready = adb_ready and not blocked_by_action
+
+        self.get_root_button.set_label("Root OK" if root_ok else "Get Root")
+        self.get_root_button.set_sensitive(ready)
+        if blocked_by_action:
+            tooltip = "Đang chạy thao tác khác."
+        elif not adb_ready:
+            tooltip = "ADB chưa connect."
+        elif root_ok:
+            tooltip = "Thiết bị đã có quyền root."
+        else:
+            tooltip = "Chọn file DEBUG...bin và chạy quy trình lấy root."
+        self.get_root_button.set_tooltip_text(tooltip)
+
+        ctx = self.get_root_button.get_style_context()
+        for css_class in ("root-ready", "root-needed", "root-ok", "root-wait"):
+            ctx.remove_class(css_class)
+        if not ready:
+            ctx.add_class("root-wait")
+        elif root_ok:
+            ctx.add_class("root-ok")
+        else:
+            ctx.add_class("root-needed")
+
     def set_terminal_button_ready(self, ready):
+        blocked_by_action = self.action_running
+        ready = bool(ready) and not blocked_by_action
         self.open_terminal_button.set_sensitive(ready)
         self.open_terminal_button.set_tooltip_text(
-            "Mở terminal và chạy ./adb.sh" if ready else "ADB chưa connect."
+            "Mở terminal và chạy ./adb.sh"
+            if ready
+            else "Đang chạy thao tác khác."
+            if blocked_by_action
+            else "ADB chưa connect."
         )
         ctx = self.open_terminal_button.get_style_context()
         for css_class in ("terminal-ready", "terminal-wait"):
