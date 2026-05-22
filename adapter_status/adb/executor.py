@@ -119,6 +119,126 @@ def run_with_input(command, input_text, timeout=10, purpose="command"):
             unregister_process(proc.pid)
 
 
+def run_streaming(
+    command,
+    timeout=60,
+    purpose="command",
+    on_output=None,
+    on_tick=None,
+    tick_interval=1.0,
+):
+    is_adb_command = command_name(command) == "adb"
+    adb_servers_before = tracked_adb_server_pids() if is_adb_command else set()
+    proc = None
+    record = None
+    chunks = []
+    start_time = time.monotonic()
+    deadline = start_time + timeout if timeout else None
+    last_tick = start_time
+    timed_out = False
+
+    def emit_output(text):
+        if on_output and text:
+            on_output(text)
+
+    def emit_tick(now):
+        if on_tick:
+            on_tick(now - start_time)
+
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=adb_env(),
+            start_new_session=True,
+        )
+        record = register_process(proc.pid, command, purpose)
+        stdout_fd = proc.stdout.fileno()
+        os.set_blocking(stdout_fd, False)
+
+        while True:
+            now = time.monotonic()
+            if deadline and now >= deadline and proc.poll() is None:
+                timed_out = True
+                if record:
+                    kill_tracked_record(record)
+                else:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except OSError:
+                        pass
+                break
+
+            if on_tick and now - last_tick >= tick_interval:
+                emit_tick(now)
+                last_tick = now
+
+            wait_time = 0.1
+            if deadline:
+                wait_time = min(wait_time, max(0.01, deadline - now))
+            readable, _writable, _error = select.select([stdout_fd], [], [], wait_time)
+            if readable:
+                while True:
+                    try:
+                        data = os.read(stdout_fd, 4096)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        data = b""
+                    if not data:
+                        break
+                    text = data.decode("utf-8", errors="replace")
+                    chunks.append(text)
+                    emit_output(text)
+
+            if proc.poll() is not None:
+                drain_deadline = time.monotonic() + 0.5
+                while time.monotonic() < drain_deadline:
+                    readable, _writable, _error = select.select([stdout_fd], [], [], 0.05)
+                    if not readable:
+                        break
+                    try:
+                        data = os.read(stdout_fd, 4096)
+                    except (BlockingIOError, OSError):
+                        break
+                    if not data:
+                        break
+                    text = data.decode("utf-8", errors="replace")
+                    chunks.append(text)
+                    emit_output(text)
+                break
+
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+        output = clean_command_output("".join(chunks))
+        if timed_out:
+            if output:
+                output += "\n"
+            output += f"Command timeout: {command_text(command)}"
+            return 124, output
+
+        return proc.returncode if proc.returncode is not None else 0, output
+    except Exception as exc:
+        return 1, str(exc)
+    finally:
+        if is_adb_command:
+            register_new_adb_servers(adb_servers_before)
+        if proc:
+            unregister_process(proc.pid)
+
+
 def run_with_delayed_pty_input(
     command,
     input_text,

@@ -44,18 +44,32 @@ def is_transient_adb_disconnect_output(output):
     return any(marker in output_lower for marker in markers)
 
 
-def run_cmdtool_update_cpu(config, log=None):
+def is_cmdtool_ipc_error(output):
+    output_lower = str(output or "").lower()
+    return (
+        "command status = -22" in output_lower
+        or "failed to create client socket file" in output_lower
+        or "/dev/shm/.ee" in output_lower
+        or "unitcliipcconnect" in output_lower
+    )
+
+
+def cleanup_cmdtool_ipc(config, purpose_prefix="cmdtool"):
+    return adb_shell(
+        config,
+        "pkill -9 cmdtool 2>/dev/null || true",
+        timeout=5,
+        purpose=f"{purpose_prefix}-cmdtool-cleanup",
+    )
+
+
+def run_cmdtool_update_cpu(config, log=None, purpose_prefix="get-root", retry_transient=True):
     target = adb_target(config)
     last_code = 1
     last_output = ""
 
     for attempt in range(1, 3):
-        adb_shell(
-            config,
-            "pkill cmdtool 2>/dev/null || true; rm -f /dev/shm/.ee 2>/dev/null || true",
-            timeout=5,
-            purpose="get-root-cmdtool-cleanup",
-        )
+        cleanup_cmdtool_ipc(config, purpose_prefix=purpose_prefix)
         time.sleep(0.5)
 
         if attempt > 1:
@@ -65,7 +79,7 @@ def run_cmdtool_update_cpu(config, log=None):
                 config,
                 wait_seconds=10.0,
                 log=log,
-                purpose="get-root-cmdtool-retry",
+                purpose=f"{purpose_prefix}-cmdtool-retry",
             )
             if state != "device":
                 return False, last_code, (
@@ -79,7 +93,7 @@ def run_cmdtool_update_cpu(config, log=None):
             prompt_text="VRS>",
             completion_texts=("command status",),
             timeout=35,
-            purpose="get-root-cmdtool",
+            purpose=f"{purpose_prefix}-cmdtool",
         )
         output = clean_command_output(output)
         last_code = code
@@ -90,10 +104,15 @@ def run_cmdtool_update_cpu(config, log=None):
         if "command status = 0" in output.lower():
             if code == 124 and log:
                 log("cmdtool đã báo status=0 nhưng không tự thoát; app đã đóng phiên cmdtool.")
+            cleanup_cmdtool_ipc(config, purpose_prefix=purpose_prefix)
             return True, code, output
 
-        transient = "offline" in output.lower() or "cannot connect to daemon" in output.lower()
-        if not transient:
+        transient = is_transient_adb_disconnect_output(output)
+        ipc_error = is_cmdtool_ipc_error(output)
+        cleanup_cmdtool_ipc(config, purpose_prefix=purpose_prefix)
+        if ipc_error and attempt == 1 and log:
+            log("cmdtool trả lỗi IPC /dev/shm/.ee (-22); đã dọn cmdtool treo và retry một lần.")
+        if not (retry_transient and transient) and not (ipc_error and attempt == 1):
             break
 
     return False, last_code, last_output

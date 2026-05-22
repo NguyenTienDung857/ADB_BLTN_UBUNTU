@@ -11,8 +11,10 @@ from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
 
 from ..config import load_config, sanitize_iface, save_config
 from ..constants import (
+    ADB_UPDATE_REMOTE_PATH,
     ANSI_ESCAPE_PATTERN,
     CONFIG_FILE,
+    DASHBOARD_RUNTIME_AUTO_REFRESH_SECONDS,
     DEFAULT_CONFIG,
     DEVICE_INFO_EMPTY_TEXT,
     FILE_COL_GRID_ICON,
@@ -42,6 +44,7 @@ from ..constants import (
 )
 from ..processes import clean_command_output, cleanup_previous_processes, terminate_popen
 from ..services.adb_device import ensure_adb_device
+from ..services.adb_update import run_adb_update, validate_update_bin_path
 from ..services.connection import (
     adb_reconnect,
     clean_reset,
@@ -71,8 +74,17 @@ from ..services.logs import (
     unregister_live_log_process,
 )
 from ..services.root import drop_adb_root, get_root_with_debug_file, validate_debug_bin_path
+from ..services.runtime_controls import (
+    CMDTOOL_FEATURES,
+    SERVICE_CONTROLS,
+    collect_runtime_status,
+    set_cmdtool_feature,
+    set_log_level,
+    set_service_feature,
+)
 from ..services.video import start_remote_video_stream
 from ..services.workspace import adb_workdir, open_terminal_session, preferred_file_dialog_dir
+from .dashboard import DashboardPanel
 from .help_text import HELP_TEXT
 from .widgets import constrain_label_width, make_text_panel, set_text_view
 
@@ -88,6 +100,8 @@ class AdapterStatus(Gtk.Window):
         cleaned_processes = cleanup_previous_processes(purpose_prefixes=("terminal", "live-log"))
         self.poll_running = False
         self.action_running = False
+        self.adb_update_running = False
+        self.dashboard_running = False
         self.file_running = False
         self.video_running = False
         self.video_session_id = 0
@@ -96,6 +110,7 @@ class AdapterStatus(Gtk.Window):
         self.live_log_proc = None
         self.live_log_session_id = 0
         self.live_log_manual_stopped = False
+        self.live_log_not_ready_count = 0
         self.selected_remote_item = None
         self.remote_entries = []
         self.file_icon_cache = {}
@@ -131,6 +146,16 @@ class AdapterStatus(Gtk.Window):
             .warn { background: #92400e; color: #ffedd5; }
             .bad { background: #7f1d1d; color: #fee2e2; }
             .card { background: #1f2937; border-radius: 14px; padding: 14px; }
+            .dashboard-card { background: #18212f; border: 1px solid #334155; border-radius: 8px; padding: 14px; }
+            .dashboard-row { border-top: 1px solid #334155; padding: 9px 0; }
+            .dashboard-section-title { color: #f9fafb; font-weight: 800; font-size: 15px; }
+            .dashboard-pill { border-radius: 16px; padding: 10px 14px; font-weight: 800; }
+            .dashboard-command-state { border-radius: 8px; padding: 6px 8px; font-weight: 800; }
+            .dashboard-status-badge { border-radius: 10px; padding: 6px 8px; font-weight: 800; font-size: 12px; }
+            .dashboard-status-note { color: #cbd5e1; font-size: 12px; padding-top: 2px; }
+            .dashboard-ok { background: #065f46; color: #d1fae5; }
+            .dashboard-warn { background: #92400e; color: #ffedd5; }
+            .dashboard-bad { background: #7f1d1d; color: #fee2e2; }
             .file-focus-bar { background: #0f172a; border-radius: 8px; padding: 3px 6px; }
             .file-focus-path { color: #cbd5e1; font-size: 12px; }
             textview, textview text { background: #1f2937; color: #e5e7eb; }
@@ -148,6 +173,9 @@ class AdapterStatus(Gtk.Window):
             button.root-wait { color: #6b7280; }
             button.unroot-ready { background-image: none; background-color: #d97706; color: #fff7ed; font-weight: 700; }
             button.unroot-wait { color: #6b7280; }
+            button.update-ready { background-image: none; background-color: #2563eb; color: #eff6ff; font-weight: 700; }
+            button.update-running { background-image: none; background-color: #7c3aed; color: #f5f3ff; font-weight: 700; }
+            button.update-wait { color: #6b7280; }
             """
         )
         Gtk.StyleContext.add_provider_for_screen(
@@ -194,38 +222,45 @@ class AdapterStatus(Gtk.Window):
         buttons = Gtk.Grid(column_spacing=10, row_spacing=8)
         root.pack_start(buttons, False, False, 0)
 
-        configure = Gtk.Button(label="Cấu hình IP")
-        configure.connect("clicked", self.configure_ip)
-        buttons.attach(configure, 0, 0, 1, 1)
+        self.configure_button = Gtk.Button(label="Cấu hình IP")
+        self.configure_button.connect("clicked", self.configure_ip)
+        buttons.attach(self.configure_button, 0, 0, 1, 1)
 
-        connect = Gtk.Button(label="ADB Connect")
-        connect.connect("clicked", self.connect_adb)
-        buttons.attach(connect, 1, 0, 1, 1)
+        self.connect_button = Gtk.Button(label="ADB Connect")
+        self.connect_button.connect("clicked", self.connect_adb)
+        buttons.attach(self.connect_button, 1, 0, 1, 1)
+
+        self.update_adb_button = Gtk.Button(label="Update ADB")
+        self.update_adb_button.set_sensitive(False)
+        self.update_adb_button.get_style_context().add_class("update-wait")
+        self.update_adb_button.set_tooltip_text("ADB chưa connect.")
+        self.update_adb_button.connect("clicked", self.choose_update_file_for_adb)
+        buttons.attach(self.update_adb_button, 2, 0, 1, 1)
 
         self.get_root_button = Gtk.Button(label="Get Root")
         self.get_root_button.set_sensitive(False)
         self.get_root_button.get_style_context().add_class("root-wait")
         self.get_root_button.set_tooltip_text("ADB chưa connect.")
         self.get_root_button.connect("clicked", self.choose_debug_file_for_root)
-        buttons.attach(self.get_root_button, 2, 0, 1, 1)
+        buttons.attach(self.get_root_button, 3, 0, 1, 1)
 
         self.drop_root_button = Gtk.Button(label="Thoát Root")
         self.drop_root_button.set_sensitive(False)
         self.drop_root_button.get_style_context().add_class("unroot-wait")
         self.drop_root_button.set_tooltip_text("Chỉ bật khi thiết bị đang root.")
         self.drop_root_button.connect("clicked", self.drop_root)
-        buttons.attach(self.drop_root_button, 3, 0, 1, 1)
+        buttons.attach(self.drop_root_button, 4, 0, 1, 1)
 
         self.open_terminal_button = Gtk.Button(label="Mở Terminal")
         self.open_terminal_button.set_sensitive(False)
         self.open_terminal_button.get_style_context().add_class("terminal-wait")
         self.open_terminal_button.set_tooltip_text("ADB chưa connect.")
         self.open_terminal_button.connect("clicked", self.open_terminal)
-        buttons.attach(self.open_terminal_button, 4, 0, 1, 1)
+        buttons.attach(self.open_terminal_button, 5, 0, 1, 1)
 
-        help_button = Gtk.Button(label="Help")
-        help_button.connect("clicked", self.show_help)
-        buttons.attach(help_button, 5, 0, 1, 1)
+        self.help_button = Gtk.Button(label="Help")
+        self.help_button.connect("clicked", self.show_help)
+        buttons.attach(self.help_button, 6, 0, 1, 1)
 
         for child in buttons.get_children():
             child.set_hexpand(True)
@@ -239,11 +274,27 @@ class AdapterStatus(Gtk.Window):
         self.device_info_label.get_style_context().add_class("device-info-line")
         root.pack_start(self.device_info_label, False, False, 0)
 
+        self.adb_update_progress = Gtk.ProgressBar()
+        self.adb_update_progress.set_show_text(True)
+        self.adb_update_progress.set_fraction(0.0)
+        self.adb_update_progress.set_text("0% - Update ADB: chờ ADB connected")
+        root.pack_start(self.adb_update_progress, False, False, 0)
+
         self.action_panel, self.action_text = make_text_panel(260, monospace=True, vexpand=True)
         root.pack_start(self.action_panel, True, True, 0)
         if self.last_action:
             self.set_action_text(self.last_action)
 
+        self.dashboard_panel = DashboardPanel(
+            self.dashboard_cmdtool_feature,
+            self.dashboard_log_level,
+            self.dashboard_service_feature,
+            self.dashboard_refresh_status,
+        )
+        self.dashboard_page_num = self.notebook.append_page(
+            self.dashboard_panel, Gtk.Label(label="Dashboard ECU")
+        )
+        self.dashboard_panel.set_adb_status(self.last_status)
         self.file_explorer_page = self.build_file_explorer_page()
         self.file_explorer_page_num = self.notebook.append_page(
             self.file_explorer_page, Gtk.Label(label="File Explorer")
@@ -254,6 +305,10 @@ class AdapterStatus(Gtk.Window):
         )
 
         GLib.timeout_add_seconds(1, self.refresh_async)
+        GLib.timeout_add_seconds(
+            DASHBOARD_RUNTIME_AUTO_REFRESH_SECONDS,
+            self.periodic_dashboard_refresh,
+        )
         GLib.timeout_add_seconds(FILE_EXPLORER_AUTO_REFRESH_SECONDS, self.periodic_file_explorer_refresh)
 
     def add_entry(self, grid, column, row, label_text, value):
@@ -271,7 +326,11 @@ class AdapterStatus(Gtk.Window):
         return entry
 
     def on_notebook_switch_page(self, _notebook, _page, page_num):
-        if page_num == getattr(self, "file_explorer_page_num", -1):
+        if page_num == getattr(self, "dashboard_page_num", -1):
+            if hasattr(self, "dashboard_panel"):
+                self.dashboard_panel.set_adb_status(self.last_status)
+            GLib.idle_add(self.dashboard_refresh_status, True)
+        elif page_num == getattr(self, "file_explorer_page_num", -1):
             GLib.idle_add(self.auto_refresh_file_explorer)
         elif page_num == getattr(self, "live_log_page_num", -1):
             GLib.idle_add(self.update_live_log_idle_status, None, True)
@@ -280,6 +339,20 @@ class AdapterStatus(Gtk.Window):
     def adb_ready_for_file_refresh(self):
         status = getattr(self, "last_status", {})
         return bool(status.get("adb_ok") or status.get("adb_state") == "device")
+
+    def dashboard_ready_for_refresh(self):
+        status = getattr(self, "last_status", {})
+        return bool(status.get("adb_ok") or status.get("adb_state") == "device")
+
+    def periodic_dashboard_refresh(self):
+        if (
+            self.notebook.get_current_page() == getattr(self, "dashboard_page_num", -1)
+            and self.dashboard_ready_for_refresh()
+            and not self.dashboard_running
+            and not self.action_running
+        ):
+            self.dashboard_refresh_status(auto=True)
+        return True
 
     def periodic_file_explorer_refresh(self):
         if self.file_running or not self.adb_ready_for_file_refresh():
@@ -356,14 +429,17 @@ class AdapterStatus(Gtk.Window):
         up_button = Gtk.Button(label="Up")
         up_button.connect("clicked", self.go_remote_parent)
         nav.pack_start(up_button, False, False, 0)
+        self.file_up_button = up_button
 
         root_button = Gtk.Button(label="Root /")
         root_button.connect("clicked", self.go_remote_root)
         nav.pack_start(root_button, False, False, 0)
+        self.file_root_button = root_button
 
         refresh_button = Gtk.Button(label="Refresh")
         refresh_button.connect("clicked", self.browse_remote_path)
         nav.pack_start(refresh_button, False, False, 0)
+        self.file_refresh_button = refresh_button
 
         self.file_focus_toggle = Gtk.ToggleButton(label="Focus")
         self.file_focus_toggle.set_tooltip_text("Ẩn phần phụ để vùng file/thư mục rộng hơn.")
@@ -385,6 +461,7 @@ class AdapterStatus(Gtk.Window):
         focus_up_button.get_style_context().add_class("compact-button")
         focus_up_button.connect("clicked", self.go_remote_parent)
         self.file_focus_bar.pack_start(focus_up_button, False, False, 0)
+        self.file_focus_up_button = focus_up_button
 
         self.file_focus_path_label = Gtk.Label(label="/")
         self.file_focus_path_label.set_xalign(0)
@@ -771,7 +848,9 @@ class AdapterStatus(Gtk.Window):
 
     def set_live_log_status(self, text):
         if hasattr(self, "live_log_status_label"):
-            self.live_log_status_label.set_text(text or "")
+            text = text or ""
+            if self.live_log_status_label.get_text() != text:
+                self.live_log_status_label.set_text(text)
 
     def live_log_root_ready(self, status=None):
         status = status if status is not None else getattr(self, "last_status", {})
@@ -989,6 +1068,7 @@ class AdapterStatus(Gtk.Window):
     def stop_live_log_process(self, message=None, manual=False):
         if manual:
             self.live_log_manual_stopped = True
+        self.live_log_not_ready_count = 0
         self.live_log_session_id += 1
         proc = self.live_log_proc
         self.live_log_proc = None
@@ -1012,21 +1092,34 @@ class AdapterStatus(Gtk.Window):
         is_regular_file = has_item and item.get("kind") == "File"
         is_image_file = is_regular_file and is_image_path(item.get("path", ""))
         is_video_file = is_regular_file and is_video_path(item.get("path", ""))
+        can_file_action = not self.file_running and not self.action_running
+
+        for widget in (
+            getattr(self, "remote_path_entry", None),
+            getattr(self, "file_up_button", None),
+            getattr(self, "file_root_button", None),
+            getattr(self, "file_refresh_button", None),
+            getattr(self, "file_focus_toggle", None),
+            getattr(self, "file_focus_up_button", None),
+            getattr(self, "file_focus_exit_button", None),
+        ):
+            if widget is not None:
+                widget.set_sensitive(can_file_action)
 
         if hasattr(self, "open_remote_button"):
-            self.open_remote_button.set_sensitive(bool(is_directory_like) and not self.file_running)
+            self.open_remote_button.set_sensitive(bool(is_directory_like) and can_file_action)
         if hasattr(self, "preview_button"):
-            self.preview_button.set_sensitive(bool(is_regular_file) and not self.file_running)
+            self.preview_button.set_sensitive(bool(is_regular_file) and can_file_action)
         if hasattr(self, "pull_button"):
-            self.pull_button.set_sensitive(bool(is_regular_file) and not self.file_running)
+            self.pull_button.set_sensitive(bool(is_regular_file) and can_file_action)
         if hasattr(self, "image_button"):
-            self.image_button.set_sensitive(bool(is_image_file) and not self.file_running)
+            self.image_button.set_sensitive(bool(is_image_file) and can_file_action)
         if hasattr(self, "video_button"):
-            self.video_button.set_sensitive(bool(is_video_file) and not self.file_running)
+            self.video_button.set_sensitive(bool(is_video_file) and can_file_action)
         if hasattr(self, "stop_video_button"):
-            self.stop_video_button.set_sensitive(self.video_running)
+            self.stop_video_button.set_sensitive(self.video_running and not self.action_running)
         if hasattr(self, "copy_path_button"):
-            self.copy_path_button.set_sensitive(has_item)
+            self.copy_path_button.set_sensitive(has_item and can_file_action)
 
     def selected_item_from_row(self, row):
         return {
@@ -1578,6 +1671,52 @@ class AdapterStatus(Gtk.Window):
         self.store_current_config()
         self.run_adb_reconnect(self.config)
 
+    def choose_update_file_for_adb(self, _button):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+        if self.file_running or self.video_running or self.dashboard_running:
+            self.set_action_text("Đang có thao tác khác chạy. Dừng thao tác đó trước khi Update ADB.")
+            return False
+        if not self.adb_ready_for_file_refresh():
+            self.set_action_text("ADB chưa ở trạng thái device nên chưa thể Update ADB.")
+            return False
+
+        dialog = Gtk.FileChooserDialog(
+            title="Chọn file update ADB .bin",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.set_modal(True)
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            "Chọn file update",
+            Gtk.ResponseType.OK,
+        )
+        home_dir = os.path.expanduser("~")
+        dialog.set_current_folder(home_dir if os.path.isdir(home_dir) else preferred_file_dialog_dir())
+
+        update_filter = Gtk.FileFilter()
+        update_filter.set_name("Update bin (*.bin)")
+        update_filter.add_pattern("*.bin")
+        update_filter.add_pattern("*.BIN")
+        dialog.add_filter(update_filter)
+
+        all_filter = Gtk.FileFilter()
+        all_filter.set_name("Tất cả file")
+        all_filter.add_pattern("*")
+        dialog.add_filter(all_filter)
+
+        response = dialog.run()
+        update_path = dialog.get_filename() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        if not update_path:
+            return False
+
+        self.store_current_config()
+        return self.run_adb_update_action(self.config, update_path)
+
     def choose_debug_file_for_root(self, _button):
         if self.action_running:
             self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
@@ -1626,6 +1765,56 @@ class AdapterStatus(Gtk.Window):
 
         self.store_current_config()
         return self.run_get_root(self.config, debug_path)
+
+    def run_adb_update_action(self, config, update_path):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        validation_error = validate_update_bin_path(update_path)
+        if validation_error:
+            self.set_action_text(validation_error)
+            self.set_update_progress(0.0, "File update không hợp lệ")
+            return False
+
+        if self.live_log_running or self.live_log_starting:
+            self.stop_live_log_process("Đã dừng Log realtime trước khi Update ADB.", manual=False)
+
+        self.action_running = True
+        self.adb_update_running = True
+        self.set_banner("ĐANG UPDATE ADB...", "warn")
+        self.set_update_progress(0.0, "Chuẩn bị update ADB")
+        self.set_action_text("Đang chuẩn bị Update ADB...")
+        self.refresh_action_controls()
+        if hasattr(self, "dashboard_panel"):
+            self.dashboard_panel.set_busy(True)
+
+        log_lines = []
+
+        def append_log(message):
+            text = clean_command_output(str(message or ""))
+            if not text:
+                return
+            log_lines.append(f"[{time.strftime('%H:%M:%S')}] {text}")
+            GLib.idle_add(self.set_action_text, "\n".join(log_lines))
+
+        def update_progress(fraction, message):
+            GLib.idle_add(self.set_update_progress, fraction, message)
+
+        append_log("Đang chuẩn bị quy trình Update ADB...")
+        append_log(f"Remote path: {ADB_UPDATE_REMOTE_PATH}")
+
+        def worker():
+            try:
+                result = run_adb_update(config, update_path, log=append_log, progress=update_progress)
+            except Exception as exc:
+                result = {"ok": False, "message": f"Lỗi không xử lý khi Update ADB: {exc}"}
+            status = "OK" if result.get("ok") else "LỖI"
+            append_log(f"Kết quả {status}: {result.get('message', '')}")
+            GLib.idle_add(self.finish_adb_update_action, result, "\n".join(log_lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
 
     def drop_root(self, _button):
         if self.action_running:
@@ -1769,6 +1958,125 @@ class AdapterStatus(Gtk.Window):
         self.last_action = message
         self.set_action_text(message)
 
+    def dashboard_cmdtool_feature(self, feature_id, enabled):
+        feature = CMDTOOL_FEATURES.get(feature_id, {})
+        state = "on" if enabled else "off"
+        title = f"{feature.get('label', feature_id)}: {'Bật' if enabled else 'Tắt'}"
+        command = f"cmdtool {feature.get('command', feature_id)} {state}"
+        return self.run_dashboard_task(
+            title,
+            command,
+            lambda config: set_cmdtool_feature(config, feature_id, enabled),
+        )
+
+    def dashboard_log_level(self, level):
+        title = f"Log level: {level}"
+        return self.run_dashboard_task(
+            title,
+            f"cmdtool log level {level}",
+            lambda config: set_log_level(config, level),
+        )
+
+    def dashboard_service_feature(self, service_id, enabled):
+        service = SERVICE_CONTROLS.get(service_id, {})
+        service_name = service.get("service", service_id)
+        state_label = "Bật" if enabled else "Tắt"
+        title = f"{service.get('label', service_id)}: {state_label}"
+        return self.run_dashboard_task(
+            title,
+            f"service {service_name} {'on' if enabled else 'off'}",
+            lambda config: set_service_feature(config, service_id, enabled),
+        )
+
+    def dashboard_refresh_status(self, auto=False):
+        return self.run_dashboard_task(
+            "Kiểm tra trạng thái runtime ECU",
+            "runtime status snapshot",
+            collect_runtime_status,
+            auto=auto,
+        )
+
+    def run_dashboard_task(self, title, command_label, action, auto=False):
+        if not hasattr(self, "dashboard_panel"):
+            return False
+        if self.dashboard_running:
+            if auto:
+                return False
+            self.dashboard_panel.show_local_message(
+                "Dashboard đang bận",
+                "Đang có command dashboard chạy, bỏ qua lệnh mới để tránh chạy chồng.",
+                ok=False,
+            )
+            return False
+        if self.action_running:
+            if auto:
+                return False
+            self.dashboard_panel.show_local_message(
+                "ADB đang bận",
+                "Đang có thao tác ADB khác chạy, chờ thao tác đó xong rồi thử lại.",
+                ok=False,
+            )
+            return False
+
+        self.store_current_config()
+        if not self.last_status.get("adb_ok"):
+            if auto:
+                return False
+            self.dashboard_panel.show_local_message(
+                "ADB chưa connected",
+                "Dashboard cần ADB ở trạng thái device. Bấm ADB Connect trước.",
+                ok=False,
+            )
+            return False
+
+        self.dashboard_running = True
+        if not auto:
+            self.action_running = True
+            self.set_banner("ĐANG CHẠY DASHBOARD COMMAND...", "warn")
+            self.set_get_root_button_ready(False, False)
+            self.set_drop_root_button_ready(False, False)
+            self.set_terminal_button_ready(False)
+            self.update_live_log_controls()
+        self.dashboard_panel.show_command_started(title, command_label, auto=auto)
+        config = dict(self.config)
+
+        def worker():
+            try:
+                result = action(config)
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "title": title,
+                    "command": command_label,
+                    "message": f"Lỗi không xử lý khi chạy dashboard command: {exc}",
+                    "code": 1,
+                    "timestamp": time.strftime("%H:%M:%S"),
+                }
+            result["auto"] = bool(auto)
+            GLib.idle_add(self.finish_dashboard_task, result)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def finish_dashboard_task(self, result):
+        was_auto = bool(result.get("auto")) if isinstance(result, dict) else False
+        self.dashboard_running = False
+        if not was_auto:
+            self.action_running = False
+        if not isinstance(result, dict):
+            result = {
+                "ok": False,
+                "title": "Dashboard command",
+                "command": "",
+                "message": str(result),
+                "code": 1,
+                "timestamp": time.strftime("%H:%M:%S"),
+            }
+        self.dashboard_panel.show_command_result(result)
+        if not was_auto:
+            self.refresh_async()
+        return False
+
     def run_service_action(self, start_message, action):
         if self.action_running:
             self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
@@ -1808,6 +2116,23 @@ class AdapterStatus(Gtk.Window):
         self.action_running = False
         self.last_action = message
         self.set_action_text(message)
+        self.refresh_action_controls()
+        self.refresh_async()
+        return False
+
+    def finish_adb_update_action(self, result, message):
+        self.adb_update_running = False
+        self.action_running = False
+        ok = bool(result.get("ok")) if isinstance(result, dict) else False
+        self.last_action = message
+        self.set_action_text(message)
+        self.set_update_progress(
+            1.0 if ok else 0.0,
+            "Update ADB hoàn tất" if ok else "Update ADB lỗi - xem log",
+        )
+        if hasattr(self, "dashboard_panel"):
+            self.dashboard_panel.set_busy(False)
+        self.refresh_action_controls()
         self.refresh_async()
         return False
 
@@ -1875,18 +2200,89 @@ class AdapterStatus(Gtk.Window):
         self.poll_running = False
         self.last_status = dict(status)
         self.set_banner(status["banner_text"], status["banner_state"])
-        self.set_terminal_button_ready(status.get("adb_ok", False))
-        self.set_get_root_button_ready(status.get("adb_ok", False), status.get("root_ok", False))
-        self.set_drop_root_button_ready(status.get("adb_ok", False), status.get("root_ok", False))
-        self.update_live_log_controls(status)
-        if (self.live_log_running or self.live_log_starting) and not self.live_log_root_ready(status):
-            self.stop_live_log_process("ADB/root không còn sẵn sàng, đã dừng Log realtime.", manual=False)
+        self.refresh_action_controls(status)
+        if hasattr(self, "dashboard_panel"):
+            self.dashboard_panel.set_adb_status(status)
+        if self.live_log_running or self.live_log_starting:
+            if self.live_log_root_ready(status):
+                self.live_log_not_ready_count = 0
+            else:
+                self.live_log_not_ready_count += 1
+                if self.live_log_not_ready_count >= 3:
+                    self.stop_live_log_process(
+                        "ADB/root mất liên tiếp, đã dừng Log realtime.",
+                        manual=False,
+                    )
         elif self.notebook.get_current_page() == getattr(self, "live_log_page_num", -1):
+            self.live_log_not_ready_count = 0
             self.update_live_log_idle_status(status)
 
         self.set_details_text(status["details"])
         self.set_device_info_line(status.get("device_info", DEVICE_INFO_EMPTY_TEXT))
         return False
+
+    def refresh_action_controls(self, status=None):
+        status = status if status is not None else getattr(self, "last_status", {})
+        adb_ready = bool(status.get("adb_ok") or status.get("adb_state") == "device")
+        root_ok = bool(status.get("root_ok"))
+        self.set_config_controls_locked(self.action_running)
+        self.set_terminal_button_ready(adb_ready)
+        self.set_update_adb_button_ready(adb_ready)
+        self.set_get_root_button_ready(adb_ready, root_ok)
+        self.set_drop_root_button_ready(adb_ready, root_ok)
+        self.update_file_buttons()
+        self.update_live_log_controls(status)
+
+    def set_config_controls_locked(self, locked):
+        ready = not bool(locked)
+        for widget in (
+            getattr(self, "iface_entry", None),
+            getattr(self, "host_entry", None),
+            getattr(self, "device_entry", None),
+            getattr(self, "port_entry", None),
+            getattr(self, "configure_button", None),
+            getattr(self, "connect_button", None),
+            getattr(self, "help_button", None),
+        ):
+            if widget is not None:
+                widget.set_sensitive(ready)
+
+    def set_update_progress(self, fraction, message):
+        if not hasattr(self, "adb_update_progress"):
+            return False
+        fraction = max(0.0, min(1.0, float(fraction or 0.0)))
+        percent = int(round(fraction * 100))
+        self.adb_update_progress.set_fraction(fraction)
+        self.adb_update_progress.set_text(f"{percent}% - {message or 'Update ADB'}")
+        return False
+
+    def set_update_adb_button_ready(self, adb_ready):
+        if not hasattr(self, "update_adb_button"):
+            return
+        blocked_by_action = self.action_running
+        running = self.adb_update_running
+        ready = bool(adb_ready) and not blocked_by_action
+
+        self.update_adb_button.set_sensitive(ready)
+        if running:
+            tooltip = "Đang chạy Update ADB."
+        elif blocked_by_action:
+            tooltip = "Đang chạy thao tác khác."
+        elif not adb_ready:
+            tooltip = "ADB chưa connect."
+        else:
+            tooltip = f"Chọn file .bin, push vào {ADB_UPDATE_REMOTE_PATH}, sync rồi chạy update cpu."
+        self.update_adb_button.set_tooltip_text(tooltip)
+
+        ctx = self.update_adb_button.get_style_context()
+        for css_class in ("update-ready", "update-running", "update-wait"):
+            ctx.remove_class(css_class)
+        if running:
+            ctx.add_class("update-running")
+        elif ready:
+            ctx.add_class("update-ready")
+        else:
+            ctx.add_class("update-wait")
 
     def set_get_root_button_ready(self, adb_ready, root_ok=False):
         if not hasattr(self, "get_root_button"):

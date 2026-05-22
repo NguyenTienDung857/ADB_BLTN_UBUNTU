@@ -47,6 +47,7 @@ Quy trình khi rút/cắm lại cổng
 Các nút thao tác
 - Cấu hình IP: gán IP adapter cho cổng đang chọn và bật cổng lên.
 - ADB Connect: gán lại IP, dọn ADB cũ/treo, rồi canh bắt ADB trong 60 giây.
+- Update ADB: chỉ sáng khi ADB đã connect; chọn file update .bin, app tự push vào /tmp/cpu_update.bin, sync, kiểm tra size rồi chạy cmdtool update cpu. Trong lúc update app khóa các nút khác và hiển thị % trên thanh tiến trình.
 - Mở Terminal: chỉ sáng khi ADB đã connect; mở terminal tại thư mục app và chạy docs/adb.sh.
 - Get Root: khi ADB đã connect nhưng chưa root, nút màu đỏ; chọn file DEBUG...bin rồi app tự push, chạy update cpu, chạy change_file và chờ thiết bị tự reboot.
 - Root OK: khi adb shell id trả uid=0(root), nút Get Root đổi màu xanh để báo thiết bị đã có quyền root.

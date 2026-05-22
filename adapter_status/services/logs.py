@@ -64,3 +64,4 @@ def terminate_live_log_process(proc):
 def unregister_live_log_process(proc):
     if proc:
         unregister_process(proc.pid)
+    
