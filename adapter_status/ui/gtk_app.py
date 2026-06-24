@@ -40,7 +40,10 @@ from ..constants import (
     IMAGE_PREVIEW_MAX_WIDTH,
     LIVE_LOG_COMMAND,
     LIVE_LOG_MAX_CHARS,
+    OEUK_REMOTE_PATH,
     REMOTE_PREVIEW_LIMIT,
+    REMOTE_LOGS_PATH,
+    REMOTE_VIDEOLIST_PATH,
 )
 from ..processes import clean_command_output, cleanup_previous_processes, terminate_popen
 from ..services.adb_device import ensure_adb_device
@@ -58,6 +61,8 @@ from ..services.files import (
     is_video_path,
     list_remote_dir,
     normalize_remote_path,
+    delete_remote_path,
+    pull_remote_path,
     pull_remote_file,
     read_remote_image,
     read_remote_text_head,
@@ -73,6 +78,7 @@ from ..services.logs import (
     terminate_live_log_process,
     unregister_live_log_process,
 )
+from ..services.oeuk import get_oeuk_with_pem, validate_pem_path
 from ..services.root import drop_adb_root, get_root_with_debug_file, validate_debug_bin_path
 from ..services.runtime_controls import (
     CMDTOOL_FEATURES,
@@ -258,9 +264,27 @@ class AdapterStatus(Gtk.Window):
         self.open_terminal_button.connect("clicked", self.open_terminal)
         buttons.attach(self.open_terminal_button, 5, 0, 1, 1)
 
+        self.get_oeuk_button = Gtk.Button(label="Get OEUK")
+        self.get_oeuk_button.set_sensitive(False)
+        self.get_oeuk_button.set_tooltip_text("Chỉ bật khi Root OK.")
+        self.get_oeuk_button.connect("clicked", self.choose_pem_file_for_oeuk)
+        buttons.attach(self.get_oeuk_button, 6, 0, 1, 1)
+
+        self.get_log_button = Gtk.Button(label="Get Log")
+        self.get_log_button.set_sensitive(False)
+        self.get_log_button.set_tooltip_text("ADB chưa connect.")
+        self.get_log_button.connect("clicked", self.choose_directory_for_logs)
+        buttons.attach(self.get_log_button, 7, 0, 1, 1)
+
+        self.get_videolist_button = Gtk.Button(label="Get VideoList")
+        self.get_videolist_button.set_sensitive(False)
+        self.get_videolist_button.set_tooltip_text("ADB chưa connect.")
+        self.get_videolist_button.connect("clicked", self.choose_directory_for_videolist)
+        buttons.attach(self.get_videolist_button, 8, 0, 1, 1)
+
         self.help_button = Gtk.Button(label="Help")
         self.help_button.connect("clicked", self.show_help)
-        buttons.attach(self.help_button, 6, 0, 1, 1)
+        buttons.attach(self.help_button, 9, 0, 1, 1)
 
         for child in buttons.get_children():
             child.set_hexpand(True)
@@ -498,6 +522,7 @@ class AdapterStatus(Gtk.Window):
         self.file_tree.set_headers_visible(True)
         self.file_tree.set_search_column(FILE_COL_NAME)
         self.file_tree.connect("row-activated", self.open_remote_row)
+        self.file_tree.connect("button-press-event", self.on_file_tree_button_press)
         self.file_tree.get_selection().connect("changed", self.on_remote_selection_changed)
 
         self.add_file_name_column(self.file_tree)
@@ -521,6 +546,7 @@ class AdapterStatus(Gtk.Window):
         self.file_grid.set_row_spacing(16)
         self.file_grid.set_column_spacing(18)
         self.file_grid.connect("item-activated", self.open_remote_grid_item)
+        self.file_grid.connect("button-press-event", self.on_file_grid_button_press)
         self.file_grid.connect("selection-changed", self.on_remote_grid_selection_changed)
 
         grid_icon_renderer = Gtk.CellRendererPixbuf()
@@ -1121,6 +1147,65 @@ class AdapterStatus(Gtk.Window):
         if hasattr(self, "copy_path_button"):
             self.copy_path_button.set_sensitive(has_item and can_file_action)
 
+    def on_file_tree_button_press(self, tree, event):
+        if getattr(event, "button", 0) != 3:
+            return False
+        path_info = tree.get_path_at_pos(int(event.x), int(event.y))
+        if path_info:
+            tree_path = path_info[0]
+            tree.get_selection().select_path(tree_path)
+            item = self.selected_item_from_model_path(tree.get_model(), tree_path)
+            self.apply_remote_selection(item, sync_views=True)
+        self.show_file_context_menu(event)
+        return True
+
+    def on_file_grid_button_press(self, icon_view, event):
+        if getattr(event, "button", 0) != 3:
+            return False
+        tree_path = icon_view.get_path_at_pos(int(event.x), int(event.y))
+        if tree_path:
+            icon_view.unselect_all()
+            icon_view.select_path(tree_path)
+            item = self.selected_item_from_model_path(icon_view.get_model(), tree_path)
+            self.apply_remote_selection(item, sync_views=True)
+        self.show_file_context_menu(event)
+        return True
+
+    def show_file_context_menu(self, event):
+        item = self.selected_remote_item
+        has_item = item is not None
+        is_dir = has_item and (item.get("is_dir") or item.get("kind") == "Liên kết")
+        is_file = has_item and item.get("kind") == "File"
+        can_file_action = not self.file_running and not self.action_running
+
+        menu = Gtk.Menu()
+        pull_item = Gtk.MenuItem(label="Pull")
+        pull_item.set_sensitive(bool(is_file) and can_file_action)
+        pull_item.connect("activate", self.pull_selected_remote_file)
+        menu.append(pull_item)
+
+        pull_folder_item = Gtk.MenuItem(label="Pull Folder")
+        pull_folder_item.set_sensitive(bool(is_dir) and can_file_action)
+        pull_folder_item.connect("activate", self.pull_selected_remote_folder)
+        menu.append(pull_folder_item)
+
+        delete_item = Gtk.MenuItem(label="Delete")
+        delete_item.set_sensitive(has_item and can_file_action)
+        delete_item.connect("activate", self.confirm_delete_selected_remote_item)
+        menu.append(delete_item)
+
+        refresh_item = Gtk.MenuItem(label="Refresh")
+        refresh_item.set_sensitive(can_file_action)
+        refresh_item.connect("activate", self.browse_remote_path)
+        menu.append(refresh_item)
+
+        menu.show_all()
+        if hasattr(menu, "popup_at_pointer"):
+            menu.popup_at_pointer(event)
+        else:
+            menu.popup(None, None, None, None, event.button, event.time)
+        return False
+
     def selected_item_from_row(self, row):
         return {
             "name": row[FILE_COL_NAME],
@@ -1426,6 +1511,130 @@ class AdapterStatus(Gtk.Window):
 
         threading.Thread(target=worker, daemon=True).start()
         return True
+
+    def choose_existing_directory(self, title):
+        dialog = Gtk.FileChooserDialog(
+            title=title,
+            parent=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.set_modal(True)
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            "Chọn thư mục",
+            Gtk.ResponseType.OK,
+        )
+        dialog.set_current_folder(preferred_file_dialog_dir())
+        response = dialog.run()
+        selected_directory = dialog.get_filename() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        return selected_directory
+
+    def pull_selected_remote_folder(self, _menu_item=None):
+        item = self.selected_remote_item
+        if not item or not (item.get("is_dir") or item.get("kind") == "Liên kết"):
+            self.set_file_info_text("Chỉ Pull Folder với thư mục.")
+            return False
+        if self.file_running:
+            self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        selected_directory = self.choose_existing_directory("Chọn thư mục lưu Pull Folder")
+        if not selected_directory:
+            return False
+
+        self.store_current_config()
+        self.file_running = True
+        self.update_file_buttons()
+        config = dict(self.config)
+        remote_path = item["path"]
+        log_lines = [
+            "Pull Folder Started",
+            "",
+            "Source:",
+            remote_path,
+            "",
+            "Destination:",
+            selected_directory,
+            "",
+        ]
+        self.set_file_info_text("\n".join(log_lines))
+
+        def append_log(message):
+            text = clean_command_output(str(message or ""))
+            if text:
+                log_lines.append(text)
+                GLib.idle_add(self.set_file_info_text, "\n".join(log_lines))
+
+        def worker():
+            code, output, destination = pull_remote_path(
+                config,
+                remote_path,
+                selected_directory,
+                timeout=600,
+                log=append_log,
+            )
+            output = clean_command_output(output)
+            result = "SUCCESS" if code == 0 else "FAILED"
+            log_lines.extend(["", "Result:", result])
+            if code != 0:
+                if output:
+                    log_lines.append(output)
+                log_lines.append(f"Lỗi ({code}) khi pull {remote_path} về {destination}.")
+            GLib.idle_add(self.finish_file_operation, "\n".join(log_lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def confirm_delete_selected_remote_item(self, _menu_item=None):
+        item = self.selected_remote_item
+        if not item:
+            self.set_file_info_text("Chưa chọn file/thư mục để Delete.")
+            return False
+        if self.file_running:
+            self.set_file_info_text("Đang có thao tác file chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.CANCEL,
+            text="Xác nhận Delete trên thiết bị?",
+        )
+        dialog.format_secondary_text(item["path"])
+        dialog.add_button("Delete", Gtk.ResponseType.OK)
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return False
+
+        self.store_current_config()
+        self.file_running = True
+        self.update_file_buttons()
+        self.set_file_info_text(f"Đang delete trên thiết bị:\n{item['path']}")
+        config = dict(self.config)
+        remote_path = item["path"]
+
+        def worker():
+            code, output = delete_remote_path(config, remote_path)
+            if code == 0:
+                message = f"Đã delete:\n{remote_path}"
+            else:
+                message = f"Delete lỗi ({code}):\n{remote_path}\n{output}"
+            GLib.idle_add(self.finish_delete_file_operation, message)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def finish_delete_file_operation(self, message):
+        self.file_running = False
+        self.selected_remote_item = None
+        self.set_file_info_text(message)
+        self.update_file_buttons()
+        self.load_remote_dir(getattr(self, "current_remote_path", "/"), quiet=True)
+        return False
 
     def view_selected_remote_image(self, _button):
         item = self.selected_remote_item
@@ -1766,6 +1975,148 @@ class AdapterStatus(Gtk.Window):
         self.store_current_config()
         return self.run_get_root(self.config, debug_path)
 
+    def choose_pem_file_for_oeuk(self, _button):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+        if self.file_running or self.video_running or self.dashboard_running:
+            self.set_action_text("Đang có thao tác khác chạy. Dừng thao tác đó trước khi Get OEUK.")
+            return False
+        if not self.last_status.get("root_ok"):
+            self.set_action_text("Root status chưa phải Root OK nên chưa thể Get OEUK.")
+            return False
+
+        dialog = Gtk.FileChooserDialog(
+            title="Chọn file OEUK PEM",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.set_modal(True)
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            "Chọn PEM",
+            Gtk.ResponseType.OK,
+        )
+        dialog.set_current_folder(preferred_file_dialog_dir())
+
+        pem_filter = Gtk.FileFilter()
+        pem_filter.set_name("PEM (*.pem)")
+        pem_filter.add_pattern("*.pem")
+        pem_filter.add_pattern("*.PEM")
+        dialog.add_filter(pem_filter)
+
+        response = dialog.run()
+        pem_path = dialog.get_filename() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        if not pem_path:
+            return False
+
+        self.store_current_config()
+        return self.run_get_oeuk(self.config, pem_path)
+
+    def choose_directory_for_logs(self, _button):
+        if not self.can_start_top_level_pull("Get Log"):
+            return False
+        selected_directory = self.choose_existing_directory("Chọn thư mục lưu Get Log")
+        if not selected_directory:
+            return False
+        self.store_current_config()
+        return self.run_top_level_pull(
+            "GET LOG",
+            REMOTE_LOGS_PATH,
+            selected_directory,
+            selected_directory,
+            timeout=900,
+            destination_is_directory=True,
+        )
+
+    def choose_directory_for_videolist(self, _button):
+        if not self.can_start_top_level_pull("Get VideoList"):
+            return False
+        selected_directory = self.choose_existing_directory("Chọn thư mục lưu Get VideoList")
+        if not selected_directory:
+            return False
+        destination = os.path.join(selected_directory, "videolist.db")
+        self.store_current_config()
+        return self.run_top_level_pull(
+            "GET VIDEOLIST",
+            REMOTE_VIDEOLIST_PATH,
+            destination,
+            destination,
+            timeout=180,
+            destination_is_directory=False,
+        )
+
+    def can_start_top_level_pull(self, label):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+        if self.file_running or self.video_running or self.dashboard_running:
+            self.set_action_text(f"Đang có thao tác khác chạy. Dừng thao tác đó trước khi {label}.")
+            return False
+        if not self.adb_ready_for_file_refresh():
+            self.set_action_text(f"ADB chưa ở trạng thái device nên chưa thể {label}.")
+            return False
+        return True
+
+    def run_top_level_pull(
+        self,
+        title,
+        remote_path,
+        pull_destination,
+        display_destination,
+        timeout=300,
+        destination_is_directory=True,
+    ):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        self.action_running = True
+        self.set_banner(f"ĐANG {title}...", "warn")
+        self.refresh_action_controls()
+        log_lines = [
+            "================================",
+            title,
+            "=" * len(title),
+            "",
+            "Source:",
+            remote_path,
+            "",
+            "Destination:",
+            display_destination,
+            "",
+        ]
+        self.set_action_text("\n".join(log_lines))
+        config = dict(self.config)
+
+        def append_log(message):
+            text = clean_command_output(str(message or ""))
+            if text:
+                log_lines.append(text)
+                GLib.idle_add(self.set_action_text, "\n".join(log_lines))
+
+        def worker():
+            code, output, _destination = pull_remote_path(
+                config,
+                remote_path,
+                pull_destination,
+                timeout=timeout,
+                log=append_log,
+                destination_is_directory=destination_is_directory,
+            )
+            output = clean_command_output(output)
+            log_lines.extend(["", "Result:", "SUCCESS" if code == 0 else "FAILED"])
+            if code != 0:
+                if output:
+                    log_lines.append(output)
+                log_lines.append(f"Lỗi ({code}) khi pull {remote_path}.")
+            GLib.idle_add(self.finish_action, "\n".join(log_lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
     def run_adb_update_action(self, config, update_path):
         if self.action_running:
             self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
@@ -1849,6 +2200,7 @@ class AdapterStatus(Gtk.Window):
         self.set_get_root_button_ready(False, False)
         self.set_drop_root_button_ready(False, False)
         self.set_terminal_button_ready(False)
+        self.refresh_action_controls()
 
         log_lines = []
 
@@ -1872,6 +2224,51 @@ class AdapterStatus(Gtk.Window):
         threading.Thread(target=worker, daemon=True).start()
         return True
 
+    def run_get_oeuk(self, config, pem_path):
+        if self.action_running:
+            self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
+            return False
+
+        validation_error = validate_pem_path(pem_path)
+        if validation_error:
+            self.set_action_text(validation_error)
+            return False
+
+        self.action_running = True
+        self.set_banner("ĐANG GET OEUK...", "warn")
+        self.refresh_action_controls()
+
+        log_lines = []
+
+        def append_log(message):
+            text = clean_command_output(str(message or ""))
+            if not text:
+                return
+            log_lines.append(f"[{time.strftime('%H:%M:%S')}] {text}")
+            GLib.idle_add(self.set_action_text, "\n".join(log_lines))
+
+        append_log("Đang chuẩn bị quy trình Get OEUK...")
+        append_log(f"Target: {OEUK_REMOTE_PATH}")
+
+        def worker():
+            try:
+                result = get_oeuk_with_pem(config, pem_path, log=append_log)
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "message": (
+                        "================================\n"
+                        "GET OEUK FAILED\n"
+                        "===============\n\n"
+                        f"Reason: Lỗi không xử lý khi Get OEUK: {exc}"
+                    ),
+                }
+            append_log(result.get("message", "Get OEUK xong nhưng không có message."))
+            GLib.idle_add(self.finish_action, "\n".join(log_lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
     def run_drop_root(self, config):
         if self.action_running:
             self.set_action_text("Đang có lệnh chạy, bỏ qua lệnh mới để tránh chạy chồng.")
@@ -1885,6 +2282,7 @@ class AdapterStatus(Gtk.Window):
         self.set_get_root_button_ready(False, False)
         self.set_drop_root_button_ready(False, False)
         self.set_terminal_button_ready(False)
+        self.refresh_action_controls()
 
         log_lines = []
 
@@ -1924,6 +2322,7 @@ class AdapterStatus(Gtk.Window):
         self.action_running = True
         self.set_banner("ĐANG RESET SẠCH ADB/IP...", "warn")
         self.set_action_text("Đang dọn ADB cũ và gán lại IP adapter...")
+        self.refresh_action_controls()
 
         def worker():
             message = clean_reset(config, include_current=include_current)
@@ -1945,6 +2344,7 @@ class AdapterStatus(Gtk.Window):
         self.action_running = True
         self.set_banner("ĐANG CONNECT ADB...", "warn")
         self.set_action_text("Đang canh ADB trong 60 giây. Có thể reset BLTN ngay bây giờ.")
+        self.refresh_action_controls()
 
         def worker():
             message = adb_reconnect(config)
@@ -2086,6 +2486,7 @@ class AdapterStatus(Gtk.Window):
         self.action_running = True
         self.set_banner("ĐANG CHẠY LỆNH...", "warn")
         self.set_action_text(start_message)
+        self.refresh_action_controls()
 
         def worker():
             try:
@@ -2105,6 +2506,7 @@ class AdapterStatus(Gtk.Window):
         self.action_running = True
         self.set_banner("ĐANG CHẠY LỆNH...", "warn")
         self.set_action_text(start_message)
+        self.refresh_action_controls()
 
         def worker():
             message = run_command_sequence(commands, timeout, purpose="action")
@@ -2231,6 +2633,8 @@ class AdapterStatus(Gtk.Window):
         self.set_update_adb_button_ready(adb_ready)
         self.set_get_root_button_ready(adb_ready, root_ok)
         self.set_drop_root_button_ready(adb_ready, root_ok)
+        self.set_get_oeuk_button_ready(adb_ready, root_ok)
+        self.set_pull_shortcut_buttons_ready(adb_ready)
         self.update_file_buttons()
         self.update_live_log_controls(status)
 
@@ -2338,6 +2742,42 @@ class AdapterStatus(Gtk.Window):
         for css_class in ("unroot-ready", "unroot-wait"):
             ctx.remove_class(css_class)
         ctx.add_class("unroot-ready" if ready else "unroot-wait")
+
+    def set_get_oeuk_button_ready(self, adb_ready, root_ok=False):
+        if not hasattr(self, "get_oeuk_button"):
+            return
+        blocked_by_action = self.action_running
+        adb_ready = bool(adb_ready)
+        root_ok = bool(root_ok) and adb_ready
+        ready = adb_ready and root_ok and not blocked_by_action
+        self.get_oeuk_button.set_sensitive(ready)
+        if blocked_by_action:
+            tooltip = "Đang chạy thao tác khác."
+        elif not adb_ready:
+            tooltip = "ADB chưa connect."
+        elif not root_ok:
+            tooltip = "Chỉ bật khi Root status là Root OK."
+        else:
+            tooltip = f"Chọn file .pem và push vào {OEUK_REMOTE_PATH}."
+        self.get_oeuk_button.set_tooltip_text(tooltip)
+
+    def set_pull_shortcut_buttons_ready(self, adb_ready):
+        blocked_by_action = self.action_running
+        ready = bool(adb_ready) and not blocked_by_action
+        for button, label in (
+            (getattr(self, "get_log_button", None), "Get Log"),
+            (getattr(self, "get_videolist_button", None), "Get VideoList"),
+        ):
+            if not button:
+                continue
+            button.set_sensitive(ready)
+            button.set_tooltip_text(
+                f"{label} qua adb pull."
+                if ready
+                else "Đang chạy thao tác khác."
+                if blocked_by_action
+                else "ADB chưa connect."
+            )
 
     def set_terminal_button_ready(self, ready):
         blocked_by_action = self.action_running

@@ -4,7 +4,7 @@ import re
 import shlex
 import time
 
-from ..adb.executor import run, run_binary
+from ..adb.executor import run, run_binary, run_streaming
 from ..config import adb_target
 from ..constants import (
     DATABASE_EXTENSIONS,
@@ -206,6 +206,46 @@ def pull_remote_file(config, remote_path):
     if code == 0:
         output = (output + "\n" if output else "") + f"Đã lưu: {destination}"
     return code, output, destination
+
+
+def pull_remote_path(
+    config,
+    remote_path,
+    local_destination,
+    timeout=300,
+    log=None,
+    destination_is_directory=True,
+):
+    normalized = normalize_remote_path(remote_path)
+    destination = os.path.abspath(os.path.expanduser(local_destination))
+    directory = destination if destination_is_directory else os.path.dirname(destination)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    def on_output(chunk):
+        text = str(chunk or "").replace("\r", "\n")
+        text = text.strip()
+        if text and log:
+            log(text)
+
+    code, output = run_streaming(
+        ["adb", "-s", adb_target(config), "pull", normalized, destination],
+        timeout=timeout,
+        purpose="file-pull-path",
+        on_output=on_output,
+        tick_interval=1.0,
+    )
+    return code, output, destination
+
+
+def delete_remote_path(config, remote_path):
+    normalized = normalize_remote_path(remote_path)
+    command = (
+        f"if [ -d {quote_remote_path(normalized)} ] && [ ! -L {quote_remote_path(normalized)} ]; then "
+        f"rm -rf {quote_remote_path(normalized)}; "
+        f"else rm -f {quote_remote_path(normalized)}; fi"
+    )
+    return adb_shell(config, command, timeout=FILE_EXPLORER_TIMEOUT, purpose="file-delete")
 
 
 def is_image_path(path):
